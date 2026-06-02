@@ -4,17 +4,19 @@ globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
 alwaysApply: false
 ---
 
-# claude-peers
+# claude-orc (claude-peers fork)
 
-Peer discovery and messaging MCP channel for Claude Code instances.
+Peer discovery and messaging MCP channel for Claude Code instances. This fork adds agent roles, broadcast, and Windows compatibility on top of the original `claude-peers`.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
-- `shared/types.ts` — Shared TypeScript types for broker API.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Endpoints: `/register`, `/heartbeat`, `/set-summary`, `/set-role`, `/list-peers`, `/list-peers-by-role`, `/send-message`, `/broadcast`, `/poll-messages`, `/unregister`, `/health`.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications every 2s. Tools: `list_peers`, `list_peers_by_role`, `send_message`, `broadcast_message`, `set_summary`, `set_role`, `check_messages`.
+- `shared/types.ts` — Shared TypeScript types for broker API and the `PeerRole` enum (`boss` | `worker` | `reviewer` | `any`).
+- `shared/platform.ts` — Cross-platform PID liveness helper (`isProcessAlive`). Replaces the original `process.kill(pid, 0)` pattern.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
-- `cli.ts` — CLI utility for inspecting broker state.
+- `cli.ts` — CLI utility for inspecting broker state. Commands: `status`, `peers`, `peers-by-role`, `send`, `broadcast`, `set-role`, `kill-broker`.
+- `tests/` — `bun:test` integration tests covering broker endpoints, polling, liveness, schema migration, and cross-platform behavior.
 
 ## Running
 
@@ -28,8 +30,19 @@ claude --dangerously-load-development-channels server:claude-peers
 # CLI:
 bun cli.ts status
 bun cli.ts peers
+bun cli.ts peers-by-role worker
 bun cli.ts send <peer-id> <message>
+bun cli.ts broadcast <message> --roles worker
+bun cli.ts set-role <peer-id> worker
 bun cli.ts kill-broker
+```
+
+## Tests
+
+```bash
+bun test                              # run all
+bun test tests/broker.test.ts         # single file
+bunx tsc --noEmit                     # typecheck
 ```
 
 ## Bun
