@@ -200,7 +200,7 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages
   WHERE to_id = ? AND delivered = 0
     AND (expires_at IS NULL OR expires_at > ?)
-  ORDER BY sent_at ASC
+  ORDER BY sent_at ASC, id ASC
 `);
 
 const markDelivered = db.prepare(`
@@ -211,7 +211,7 @@ const selectHistoryInbox = db.prepare(`
   SELECT * FROM messages
   WHERE to_id = ? AND (expires_at IS NULL OR expires_at > ?)
     AND (? IS NULL OR sent_at > ?)
-  ORDER BY sent_at DESC
+  ORDER BY sent_at DESC, id DESC
   LIMIT ?
 `);
 
@@ -219,7 +219,7 @@ const selectHistoryOutbox = db.prepare(`
   SELECT * FROM messages
   WHERE from_id = ? AND (expires_at IS NULL OR expires_at > ?)
     AND (? IS NULL OR sent_at > ?)
-  ORDER BY sent_at DESC
+  ORDER BY sent_at DESC, id DESC
   LIMIT ?
 `);
 
@@ -228,7 +228,7 @@ const selectHistoryAll = db.prepare(`
   WHERE (from_id = ? OR to_id = ?)
     AND (expires_at IS NULL OR expires_at > ?)
     AND (? IS NULL OR sent_at > ?)
-  ORDER BY sent_at DESC
+  ORDER BY sent_at DESC, id DESC
   LIMIT ?
 `);
 
