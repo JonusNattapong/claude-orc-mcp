@@ -17,8 +17,12 @@ This is a fork of [louislva/claude-peers-mcp](https://github.com/louislva/claude
 
 - **Agent roles** (`boss` / `worker` / `reviewer` / `any`) for orchestrating multi-agent teams
 - **`broadcast_message`** tool to message every peer (optionally filtered by role)
+- **Presence** — every peer carries a short free-form status string (e.g. `typing`, `idle`, `busy coding`) that surfaces in the channel and in `list_peers`
+- **Message history** — queryable inbox/outbox/all with configurable limit
+- **Message TTL** — auto-expiry of unread messages after a default of 24h (configurable, disable-able)
 - **2-second polling** loop (was 1s) to reduce idle CPU while staying responsive
 - **Windows-native compatibility** — cross-platform PID liveness check, bun executable discovery, TTY detection, and `kill-broker` (`netstat` + `taskkill` instead of `lsof`)
+- **GitHub Actions CI** — typecheck, tests, and bundle build on Ubuntu, Windows, and macOS
 
 Fully backward compatible with the original `claude-peers`. Same port (7899), same DB schema (the new `role` column is added via `ALTER TABLE` on existing databases), all original tools and endpoints still work.
 
@@ -60,12 +64,14 @@ The other Claude receives it immediately and responds.
 
 | Tool                   | What it does                                                                          |
 | ---------------------- | ------------------------------------------------------------------------------------- |
-| `list_peers`           | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`        |
+| `list_peers`           | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` (optional `role` / `presence` filter) |
 | `list_peers_by_role`   | Find peers by their declared role (boss/worker/reviewer/any)                          |
-| `send_message`         | Send a message to another instance by ID (arrives instantly via channel push)         |
-| `broadcast_message`    | Send a message to every peer at once (optional role / include / exclude filters)      |
+| `send_message`         | Send a message to another instance by ID (optional `ttl_seconds` override)            |
+| `broadcast_message`    | Send a message to every peer at once (optional role / include / exclude filters, optional `ttl_seconds`) |
 | `set_summary`          | Describe what you're working on (visible to other peers)                              |
 | `set_role`             | Declare your role in the agent team (boss/worker/reviewer/any)                        |
+| `set_presence`         | Update your free-form presence string (e.g. `typing`, `idle`, `busy`)                 |
+| `message_history`      | Fetch recent message history for a peer (`inbox` / `outbox` / `all`, with limit)      |
 | `check_messages`       | Manually check for messages (fallback if not using channel mode)                      |
 
 ## Roles: orchestrating multi-agent teams
@@ -131,13 +137,15 @@ Inspect and interact from the command line:
 ```bash
 cd ~/claude-orc
 
-bun cli.ts status                       # broker status + all peers
-bun cli.ts peers                        # list all peers
+bun cli.ts status                       # broker status + all peers (shows TTL)
+bun cli.ts peers                        # list all peers (shows role + presence)
 bun cli.ts peers-by-role worker         # list peers with role "worker"
 bun cli.ts send <id> <msg>              # send a message into a Claude session
 bun cli.ts broadcast <msg>              # broadcast to every peer
 bun cli.ts broadcast <msg> --roles worker  # broadcast to specific role
 bun cli.ts set-role <id> worker         # change a peer's role
+bun cli.ts set-presence <id> <string>   # set a peer's presence (e.g. "typing")
+bun cli.ts history <id> [limit] [dir]   # message history (inbox|outbox|all; default 10, all)
 bun cli.ts kill-broker                  # stop the broker (uses lsof on Unix, netstat+taskkill on Windows)
 ```
 
@@ -158,11 +166,12 @@ If you set `OPENAI_API_KEY` in your environment, each instance generates a brief
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| Environment variable              | Default              | Description                                                |
+| --------------------------------- | -------------------- | ---------------------------------------------------------- |
+| `CLAUDE_PEERS_PORT`               | `7899`               | Broker port                                                |
+| `CLAUDE_PEERS_DB`                 | `~/.claude-peers.db` | SQLite database path                                       |
+| `CLAUDE_PEERS_MESSAGE_TTL_HOURS`  | `24`                 | Default message TTL in hours (`0` disables expiry)         |
+| `OPENAI_API_KEY`                  | —                    | Enables auto-summary via gpt-5.4-nano                      |
 
 ## Development
 
@@ -171,14 +180,19 @@ bun test                              # run all tests
 bun test tests/broker.test.ts         # run a single file
 bunx tsc --noEmit                     # typecheck
 bun broker.ts                         # run broker standalone
+bun run build                         # build dist/{broker,server,cli}.js
+bun run prepublishOnly                # typecheck + test + build (CI parity)
 ```
+
+CI runs on every push and pull request across `ubuntu-latest`, `windows-latest`, and `macos-latest` (Bun 1.3.x, frozen lockfile), and uploads the bundled `dist/` artifacts on every build.
 
 ## Backward compatibility
 
 - Same port (7899) and same DB file format.
-- The new `role` column is added via `ALTER TABLE` on existing databases; default is `'any'`.
+- The new `role`, `presence`, and `messages.expires_at` columns are added via `ALTER TABLE` on existing databases; default for `role` is `'any'`, `presence` is `''`, and `expires_at` is `NULL` (no expiry).
 - All original endpoints (`/register`, `/heartbeat`, `/set-summary`, `/list-peers`, `/send-message`, `/poll-messages`, `/unregister`) and tools (`list_peers`, `send_message`, `set_summary`, `check_messages`) work unchanged.
-- New endpoints (`/set-role`, `/list-peers-by-role`, `/broadcast`) and tools (`set_role`, `list_peers_by_role`, `broadcast_message`) are purely additive.
+- New endpoints (`/set-role`, `/list-peers-by-role`, `/broadcast`, `/set-presence`, `/messages/history`) and tools (`set_role`, `list_peers_by_role`, `broadcast_message`, `set_presence`, `message_history`) are purely additive.
+- `set_presence` and `message_history` are advertised in the MCP `tools` list, so any client that auto-discovers tools will see them.
 
 ## Requirements
 

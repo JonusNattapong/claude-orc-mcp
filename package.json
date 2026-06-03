@@ -1,16 +1,41 @@
 {
-  "name": "claude-peers",
-  "version": "0.1.0",
-  "description": "Peer discovery and messaging for Claude Code instances",
+  "name": "claude-orc",
+  "version": "0.2.0",
+  "description": "Peer discovery, agent roles, broadcast, and messaging for Claude Code instances (Windows/macOS/Linux). Fork of claude-peers-mcp.",
   "module": "index.ts",
   "type": "module",
-  "private": true,
   "license": "MIT",
+  "bin": {
+    "claude-orc": "./dist/cli.js",
+    "claude-orc-broker": "./dist/broker.js",
+    "claude-orc-server": "./dist/server.js"
+  },
+  "files": [
+    "dist",
+    "shared",
+    "README.md",
+    "LICENSE",
+    ".mcp.json"
+  ],
   "scripts": {
     "broker": "bun broker.ts",
     "server": "bun server.ts",
-    "test": "bun test"
+    "cli": "bun cli.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "build": "bun build broker.ts --target=bun --outdir dist && bun build server.ts --target=node --outdir dist --external @modelcontextprotocol/sdk && bun build cli.ts --target=bun --outdir dist",
+    "prepublishOnly": "bun run typecheck && bun run test && bun run build"
   },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "mcp-server",
+    "agent",
+    "multi-agent",
+    "peer-discovery",
+    "broadcast"
+  ],
   "devDependencies": {
     "@types/bun": "latest"
   },

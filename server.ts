@@ -202,12 +202,14 @@ IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPO
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
+- list_peers: Discover other Claude Code instances (scope: machine/directory/repo, optional role/presence filter)
 - list_peers_by_role: Discover peers by role (boss/worker/reviewer/any)
 - send_message: Send a message to another instance by ID
 - broadcast_message: Send a message to every peer (optionally filter by role)
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - set_role: Declare your role in the agent team (boss/worker/reviewer/any)
+- set_presence: Set a short status string (typing/idle/busy/reviewing/...) visible to other peers
+- message_history: Fetch past messages (inbox/outbox/all) for catch-up after downtime
 - check_messages: Manually check for new messages (the polling loop already pushes them automatically)
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
@@ -335,6 +337,44 @@ const TOOLS = [
     },
   },
   {
+    name: "set_presence",
+    description:
+      "Set a short presence string (max 64 chars) like 'typing', 'idle', 'busy', 'reviewing'. Other peers can filter by it. Stripped of control characters.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        presence: {
+          type: "string" as const,
+          description: "Short status string. Empty string clears it.",
+        },
+      },
+      required: ["presence"],
+    },
+  },
+  {
+    name: "message_history",
+    description:
+      "Fetch recent message history (inbox by default). Useful for catching up on what other peers sent while this instance was offline.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        limit: {
+          type: "number" as const,
+          description: "Max messages to return (1-500). Default 50.",
+        },
+        since: {
+          type: "string" as const,
+          description: "Only return messages newer than this ISO timestamp.",
+        },
+        direction: {
+          type: "string" as const,
+          enum: ["inbox", "outbox", "all"],
+          description: "Which messages to return. Default: inbox.",
+        },
+      },
+    },
+  },
+  {
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications (every 2 seconds), but you can use this as a fallback.",
@@ -361,6 +401,7 @@ function formatPeer(p: Peer): string {
   if (p.git_root) parts.push(`Repo: ${p.git_root}`);
   if (p.tty) parts.push(`TTY: ${p.tty}`);
   if (p.summary) parts.push(`Summary: ${p.summary}`);
+  if (p.presence) parts.push(`Presence: ${p.presence}`);
   parts.push(`Last seen: ${p.last_seen}`);
   return parts.join("\n  ");
 }
@@ -599,6 +640,89 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "set_presence": {
+      const { presence } = args as { presence: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/set-presence", {
+          id: myId,
+          presence,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to set presence: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Presence updated: "${presence}"` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting presence: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "message_history": {
+      const { limit, since, direction } = args as {
+        limit?: number;
+        since?: string;
+        direction?: "inbox" | "outbox" | "all";
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ messages: Array<{ from_id: string; to_id: string; text: string; sent_at: string }>; count: number }>(
+          "/messages/history",
+          { id: myId, limit, since, direction }
+        );
+        if (result.messages.length === 0) {
+          return {
+            content: [
+              { type: "text" as const, text: `No messages in ${direction ?? "inbox"} history.` },
+            ],
+          };
+        }
+        const lines = result.messages.map(
+          (m) => `${m.sent_at}  ${m.from_id} -> ${m.to_id}\n${m.text}`
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${result.count} message(s) (${direction ?? "inbox"}):\n\n${lines.join("\n\n---\n\n")}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error fetching history: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     case "check_messages": {
       if (!myId) {
         return {
@@ -658,6 +782,7 @@ async function pollAndPushMessages() {
       let fromSummary = "";
       let fromCwd = "";
       let fromRole = "";
+      let fromPresence = "";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope: "machine",
@@ -669,6 +794,7 @@ async function pollAndPushMessages() {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
           fromRole = sender.role;
+          fromPresence = sender.presence;
         }
       } catch {
         // Non-critical, proceed without sender info
@@ -682,6 +808,7 @@ async function pollAndPushMessages() {
           meta: {
             from_id: msg.from_id,
             from_role: fromRole,
+            from_presence: fromPresence,
             from_summary: fromSummary,
             from_cwd: fromCwd,
             sent_at: msg.sent_at,

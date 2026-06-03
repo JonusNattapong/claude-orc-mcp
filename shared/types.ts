@@ -17,6 +17,7 @@ export interface Peer {
   tty: string | null;
   summary: string;
   role: PeerRole;
+  presence: string; // free-form short string ("typing", "idle", "busy", "reviewing", etc.)
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -28,6 +29,7 @@ export interface Message {
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;
+  expires_at: string | null; // ISO timestamp or null for never-expire
 }
 
 // --- Broker API types ---
@@ -39,6 +41,7 @@ export interface RegisterRequest {
   tty: string | null;
   summary: string;
   role?: PeerRole;
+  presence?: string;
 }
 
 export interface RegisterResponse {
@@ -47,6 +50,7 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+  presence?: string;
 }
 
 export interface SetSummaryRequest {
@@ -59,12 +63,20 @@ export interface SetRoleRequest {
   role: PeerRole;
 }
 
+export interface SetPresenceRequest {
+  id: PeerId;
+  presence: string;
+}
+
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
-  // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
   exclude_id?: PeerId;
+  // Optional role filter (one of boss/worker/reviewer/any).
+  role?: PeerRole;
+  // Optional presence substring filter (case-insensitive).
+  presence?: string;
 }
 
 export interface ListPeersByRoleRequest {
@@ -76,17 +88,18 @@ export interface SendMessageRequest {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+  // Optional TTL in seconds. If omitted, broker default applies.
+  // 0 or negative means "never expire".
+  ttl_seconds?: number;
 }
 
 export interface BroadcastRequest {
   from_id: PeerId;
   text: string;
-  // When set, only peers whose role matches any of these receive the message.
-  // If omitted, all peers (other than `from_id`) are targeted.
   roles?: PeerRole[];
-  // Optional include/exclude lists for finer control
   include_ids?: PeerId[];
   exclude_ids?: PeerId[];
+  ttl_seconds?: number;
 }
 
 export interface BroadcastResponse {
@@ -98,8 +111,25 @@ export interface BroadcastResponse {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  // Optional: only return messages newer than this ISO timestamp.
+  since?: string;
 }
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+export interface MessageHistoryRequest {
+  id: PeerId;
+  // Max number of messages to return (newest first). Default 50, capped at 500.
+  limit?: number;
+  // Only return messages newer than this ISO timestamp.
+  since?: string;
+  // "inbox" (default, only received), "outbox" (only sent), or "all" (both).
+  direction?: "inbox" | "outbox" | "all";
+}
+
+export interface MessageHistoryResponse {
+  messages: Message[];
+  count: number;
 }

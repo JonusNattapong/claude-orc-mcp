@@ -263,7 +263,7 @@ describe("server.ts static guarantees", () => {
     expect(src).toMatch(/isProcessAlive\(/);
   });
 
-  test("server.ts declares all 7 expected tools", () => {
+  test("server.ts declares all expected tools", () => {
     const src = readFileSync(join(import.meta.dir, "..", "server.ts"), "utf8");
     for (const name of [
       "list_peers",
@@ -272,6 +272,8 @@ describe("server.ts static guarantees", () => {
       "broadcast_message",
       "set_summary",
       "set_role",
+      "set_presence",
+      "message_history",
       "check_messages",
     ]) {
       expect(src).toContain(`name: "${name}"`);
