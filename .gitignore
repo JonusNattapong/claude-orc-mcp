@@ -32,3 +32,18 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# claude-peers broker artifacts
+# SQLite database files (default at ~/.claude-peers.db, but tests + smoke use local copies)
+*.db
+*.db-wal
+*.db-shm
+*-wal
+*-shm
+# ad-hoc log files written by the smoke-test script
+broker-stdout.log
+broker-stderr.log
+child.log
+child.err
+# Windows PowerShell transcript output
+*.transcript
