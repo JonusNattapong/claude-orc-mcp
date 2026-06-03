@@ -15,6 +15,8 @@
  * New in this fork:
  *   - 2s poll interval (was 1s) to reduce idle CPU while staying responsive
  *   - broadcast_message, set_role, list_peers_by_role tools
+ *   - set_presence, message_history, get_thread tools (presence + history + threading)
+ *   - reply_to passed through send_message, broadcast_message, and channel push
  *   - cross-platform getTty + ensureBroker (Windows native)
  */
 
@@ -31,6 +33,8 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
   BroadcastResponse,
+  Message,
+  ThreadResponse,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -204,12 +208,13 @@ Read the from_id, from_summary, and from_cwd attributes to understand who sent t
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo, optional role/presence filter)
 - list_peers_by_role: Discover peers by role (boss/worker/reviewer/any)
-- send_message: Send a message to another instance by ID
-- broadcast_message: Send a message to every peer (optionally filter by role)
+- send_message: Send a message to another instance by ID (optional reply_to to thread a reply)
+- broadcast_message: Send a message to every peer (optionally filter by role; optional reply_to)
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - set_role: Declare your role in the agent team (boss/worker/reviewer/any)
 - set_presence: Set a short status string (typing/idle/busy/reviewing/...) visible to other peers
 - message_history: Fetch past messages (inbox/outbox/all) for catch-up after downtime
+- get_thread: Fetch a full conversation thread by the id of any message in it
 - check_messages: Manually check for new messages (the polling loop already pushes them automatically)
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
@@ -255,7 +260,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification. Pass reply_to with the id of an earlier message to thread your message as a reply to it.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -267,6 +272,10 @@ const TOOLS = [
           type: "string" as const,
           description: "The message to send",
         },
+        reply_to: {
+          type: "number" as const,
+          description: "Optional message id this message is replying to. Use get_thread to discover message ids.",
+        },
       },
       required: ["to_id", "message"],
     },
@@ -274,7 +283,7 @@ const TOOLS = [
   {
     name: "broadcast_message",
     description:
-      "Send a message to every Claude Code instance (optionally filtered by role). Useful when a 'boss' agent needs to announce work to all 'worker' agents at once.",
+      "Send a message to every Claude Code instance (optionally filtered by role). Useful when a 'boss' agent needs to announce work to all 'worker' agents at once. Pass reply_to to thread this broadcast as a reply to a prior message.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -300,6 +309,10 @@ const TOOLS = [
           type: "array" as const,
           items: { type: "string" as const },
           description: "Optional peer IDs to skip.",
+        },
+        reply_to: {
+          type: "number" as const,
+          description: "Optional message id this broadcast is replying to.",
         },
       },
       required: ["message"],
@@ -381,6 +394,21 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "get_thread",
+    description:
+      "Fetch a full conversation thread given the id of any message in it (the root or any reply). Returns the root message and all replies in chronological order. Use this to reconstruct a multi-turn conversation after coming back online, or to look up context for an inbound message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "number" as const,
+          description: "Id of any message in the thread (root or reply).",
+        },
+      },
+      required: ["id"],
     },
   },
 ];
@@ -493,7 +521,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, reply_to } = args as {
+        to_id: string;
+        message: string;
+        reply_to?: number | null;
+      };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -505,6 +537,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           to_id,
           text: message,
+          reply_to: reply_to ?? null,
         });
         if (!result.ok) {
           return {
@@ -513,7 +546,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [
+            {
+              type: "text" as const,
+              text: reply_to != null
+                ? `Reply (to msg ${reply_to}) sent to peer ${to_id}`
+                : `Message sent to peer ${to_id}`,
+            },
+          ],
         };
       } catch (e) {
         return {
@@ -529,11 +569,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "broadcast_message": {
-      const { message, roles, include_ids, exclude_ids } = args as {
+      const { message, roles, include_ids, exclude_ids, reply_to } = args as {
         message: string;
         roles?: PeerRole[];
         include_ids?: string[];
         exclude_ids?: string[];
+        reply_to?: number | null;
       };
       if (!myId) {
         return {
@@ -548,6 +589,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           roles,
           include_ids,
           exclude_ids,
+          reply_to: reply_to ?? null,
         });
         if (!result.ok) {
           return {
@@ -561,7 +603,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `Broadcast delivered to ${result.count} peer(s): ${result.delivered_to.join(", ") || "(none)"}`,
+              text: reply_to != null
+                ? `Broadcast reply (to msg ${reply_to}) delivered to ${result.count} peer(s): ${result.delivered_to.join(", ") || "(none)"}`
+                : `Broadcast delivered to ${result.count} peer(s): ${result.delivered_to.join(", ") || "(none)"}`,
             },
           ],
         };
@@ -723,6 +767,48 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "get_thread": {
+      const { id } = args as { id: number };
+      try {
+        const result = await brokerFetch<
+          | { root: Message; replies: Message[]; count: number }
+          | { error: string }
+        >("/messages/thread", { id });
+        if ("error" in result) {
+          return {
+            content: [{ type: "text" as const, text: `Thread not found: ${result.error}` }],
+            isError: true,
+          };
+        }
+        const renderMsg = (m: Message, prefix: string) =>
+          `${prefix}[${m.id}] ${m.sent_at}  ${m.from_id} -> ${m.to_id}` +
+          (m.reply_to != null ? `  (in reply to ${m.reply_to})` : "") +
+          `\n${m.text}`;
+        const lines = [
+          renderMsg(result.root, ""),
+          ...result.replies.map((m) => renderMsg(m, "  ")),
+        ];
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Thread (${result.count} message${result.count === 1 ? "" : "s"}):\n\n${lines.join("\n\n---\n\n")}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error fetching thread: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     case "check_messages": {
       if (!myId) {
         return {
@@ -812,6 +898,9 @@ async function pollAndPushMessages() {
             from_summary: fromSummary,
             from_cwd: fromCwd,
             sent_at: msg.sent_at,
+            // If this message is a reply, surface that to the receiving
+            // Claude so it can call get_thread to fetch context.
+            reply_to: msg.reply_to ?? null,
           },
         },
       });
