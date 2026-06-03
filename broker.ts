@@ -14,6 +14,7 @@
  *   - /messages/history endpoint to query past messages
  *   - /set-presence + presence column for "typing" / activity status
  *   - message TTL (configurable, default 24h)
+ *   - /messages/thread endpoint and reply_to column for threaded conversations
  *   - cross-platform process liveness check (works on Windows + Unix)
  */
 
@@ -34,6 +35,8 @@ import type {
   PollMessagesResponse,
   MessageHistoryRequest,
   MessageHistoryResponse,
+  ThreadRequest,
+  ThreadResponse,
   Peer,
   PeerRole,
   Message,
@@ -110,11 +113,17 @@ db.run(`
   if (!msgCols.has("expires_at")) {
     db.run("ALTER TABLE messages ADD COLUMN expires_at TEXT");
   }
+  if (!msgCols.has("reply_to")) {
+    // reply_to points at messages.id of the parent message in a thread.
+    // NULL means "this is a root message (not a reply)".
+    db.run("ALTER TABLE messages ADD COLUMN reply_to INTEGER");
+  }
 }
 
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_to_undelivered ON messages(to_id, delivered, sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id, sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL");
+db.run("CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to) WHERE reply_to IS NOT NULL");
 
 // --- Periodic cleanup ---
 
@@ -192,8 +201,8 @@ const selectPeersByRole = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, expires_at)
-  VALUES (?, ?, ?, ?, 0, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, expires_at, reply_to)
+  VALUES (?, ?, ?, ?, 0, ?, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -231,6 +240,42 @@ const selectHistoryAll = db.prepare(`
   ORDER BY sent_at DESC, id DESC
   LIMIT ?
 `);
+
+// Walks the reply_to chain from `id` up to the root, then collects every
+// message in the thread in chronological order. Recursive CTE finds both
+// the root and all descendants in a single query.
+//
+// `up` walks from the given message to its ancestors via reply_to.
+// `root` picks the first ancestor whose reply_to is NULL (the thread root).
+// `down` walks from the root to all descendants via the reverse of reply_to.
+const selectThread = db.query<
+  Message,
+  [number]
+>(`
+  WITH RECURSIVE
+  up(id, reply_to) AS (
+    SELECT id, reply_to FROM messages WHERE id = ?
+    UNION ALL
+    SELECT m.id, m.reply_to FROM messages m
+    JOIN up u ON m.id = u.reply_to
+  ),
+  root(id) AS (
+    SELECT id FROM up WHERE reply_to IS NULL
+  ),
+  down(id) AS (
+    SELECT id FROM root
+    UNION ALL
+    SELECT m.id FROM messages m
+    JOIN down d ON m.reply_to = d.id
+  )
+  SELECT m.* FROM messages m
+  WHERE m.id IN (SELECT id FROM down)
+  ORDER BY m.sent_at ASC, m.id ASC
+`);
+
+const messageExists = db.query<{ id: number }, [number]>(
+  `SELECT id FROM messages WHERE id = ?`
+);
 
 // --- Generate peer ID ---
 
@@ -407,8 +452,23 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
+  // Validate reply_to if provided. The parent message must exist; we
+  // intentionally do NOT require it to involve the same peers, so any
+  // peer can reply to any message they have access to.
+  let replyTo: number | null = null;
+  if (body.reply_to != null) {
+    if (typeof body.reply_to !== "number" || !Number.isFinite(body.reply_to) || !Number.isInteger(body.reply_to) || body.reply_to <= 0) {
+      return { ok: false, error: `reply_to must be a positive integer` };
+    }
+    const parent = messageExists.get(body.reply_to);
+    if (!parent) {
+      return { ok: false, error: `reply_to message ${body.reply_to} not found` };
+    }
+    replyTo = body.reply_to;
+  }
+
   const expiresAt = computeExpiry(body.ttl_seconds);
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), expiresAt);
+  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), expiresAt, replyTo);
   return { ok: true };
 }
 
@@ -443,6 +503,29 @@ function handleBroadcast(body: BroadcastRequest): BroadcastResponse {
     roles = validated;
   }
 
+  // Validate reply_to if provided (same rules as send-message).
+  let replyTo: number | null = null;
+  if (body.reply_to != null) {
+    if (typeof body.reply_to !== "number" || !Number.isFinite(body.reply_to) || !Number.isInteger(body.reply_to) || body.reply_to <= 0) {
+      return {
+        ok: false,
+        count: 0,
+        delivered_to: [],
+        error: `reply_to must be a positive integer`,
+      };
+    }
+    const parent = messageExists.get(body.reply_to);
+    if (!parent) {
+      return {
+        ok: false,
+        count: 0,
+        delivered_to: [],
+        error: `reply_to message ${body.reply_to} not found`,
+      };
+    }
+    replyTo = body.reply_to;
+  }
+
   const includeSet = body.include_ids && body.include_ids.length > 0
     ? new Set(body.include_ids)
     : null;
@@ -460,7 +543,7 @@ function handleBroadcast(body: BroadcastRequest): BroadcastResponse {
   const expiresAt = computeExpiry(body.ttl_seconds);
   const delivered: string[] = [];
   for (const target of candidates) {
-    insertMessage.run(body.from_id, target.id, body.text, sentAt, expiresAt);
+    insertMessage.run(body.from_id, target.id, body.text, sentAt, expiresAt, replyTo);
     delivered.push(target.id);
   }
 
@@ -515,6 +598,32 @@ function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryRespon
   return { messages: rows, count: rows.length };
 }
 
+function handleThread(body: ThreadRequest): ThreadResponse | { error: string } {
+  if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+    return { error: "id must be a positive integer" };
+  }
+  // Cheap existence check up front so we can return a clean 404 for
+  // unknown ids instead of an empty thread.
+  const exists = messageExists.get(body.id);
+  if (!exists) {
+    return { error: `message ${body.id} not found` };
+  }
+  const rows = selectThread.all(body.id) as Message[];
+  if (rows.length === 0) {
+    // Defensive: should not happen because we just confirmed existence.
+    return { error: `message ${body.id} not found` };
+  }
+  // The root is the row whose reply_to is null. Prefer the one matching the
+  // requested id (in case the request asked for the root directly); otherwise
+  // the earliest reply_to === null row in the chain.
+  const root: Message =
+    rows.find((m) => m.reply_to == null && m.id === body.id) ??
+    rows.find((m) => m.reply_to == null) ??
+    rows[0]!;
+  const replies = rows.filter((m) => m.id !== root.id);
+  return { root, replies, count: rows.length };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -567,6 +676,8 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/messages/history":
           return Response.json(handleMessageHistory(body as MessageHistoryRequest));
+        case "/messages/thread":
+          return Response.json(handleThread(body as ThreadRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

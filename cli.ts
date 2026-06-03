@@ -5,15 +5,16 @@
  * Utility commands for managing the broker and inspecting peers.
  *
  * Usage:
- *   bun cli.ts status                  — Show broker status and all peers
- *   bun cli.ts peers                   — List all peers
- *   bun cli.ts peers-by-role <r>       — List peers filtered by role
- *   bun cli.ts send <id> <msg>         — Send a message to a peer
- *   bun cli.ts broadcast <msg>         — Broadcast a message to every peer
- *   bun cli.ts set-role <id> <r>       — Set a peer's role
- *   bun cli.ts set-presence <id> <p>   — Set a peer's presence string
- *   bun cli.ts history <id>            — Show recent message history for a peer
- *   bun cli.ts kill-broker             — Stop the broker daemon
+ *   bun cli.ts status                       — Show broker status and all peers
+ *   bun cli.ts peers                        — List all peers
+ *   bun cli.ts peers-by-role <r>            — List peers filtered by role
+ *   bun cli.ts send <id> <msg> [--reply-to N]   — Send a message to a peer (optionally reply)
+ *   bun cli.ts broadcast <msg> [--reply-to N]   — Broadcast (optionally as a reply)
+ *   bun cli.ts set-role <id> <r>            — Set a peer's role
+ *   bun cli.ts set-presence <id> <p>        — Set a peer's presence string
+ *   bun cli.ts history <id> [limit] [dir]   — Show recent message history for a peer
+ *   bun cli.ts thread <msg-id>              — Show a full conversation thread
+ *   bun cli.ts kill-broker                  — Stop the broker daemon
  */
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
@@ -66,6 +67,42 @@ async function listAllPeers(): Promise<PeerRow[]> {
 }
 
 const cmd = process.argv[2];
+
+/**
+ * Parse an optional `--reply-to <id>` flag from the argv tail.
+ * Returns the parsed message id (positive integer) or null if absent.
+ * Exits the process with usage info if the flag is present but malformed.
+ */
+function parseReplyToFlag(): number | null {
+  const flagIdx = process.argv.indexOf("--reply-to");
+  if (flagIdx < 0) return null;
+  const raw = process.argv[flagIdx + 1];
+  if (!raw) {
+    console.error("Error: --reply-to requires a message id");
+    process.exit(1);
+  }
+  const n = parseInt(raw, 10);
+  if (!Number.isInteger(n) || n <= 0) {
+    console.error(`Error: --reply-to must be a positive integer, got "${raw}"`);
+    process.exit(1);
+  }
+  return n;
+}
+
+/**
+ * Like `parseReplyToFlag`, but also returns the argv tail with the
+ * `--reply-to <id>` pair removed, so the caller can fold the rest into
+ * the message body without the flag leaking in.
+ */
+function takeReplyTo(): { replyTo: number | null; rest: string[] } {
+  const flagIdx = process.argv.indexOf("--reply-to");
+  if (flagIdx < 0) return { replyTo: null, rest: process.argv };
+  // Validate the flag's value first (exits on bad input).
+  const replyTo = parseReplyToFlag();
+  // Now strip the flag and its value out of argv.
+  const rest = process.argv.filter((_, i) => i !== flagIdx && i !== flagIdx + 1);
+  return { replyTo, rest };
+}
 
 switch (cmd) {
   case "status": {
@@ -121,9 +158,15 @@ switch (cmd) {
 
   case "send": {
     const toId = process.argv[3];
-    const msg = process.argv.slice(4).join(" ");
-    if (!toId || !msg) {
-      console.error("Usage: bun cli.ts send <peer-id> <message>");
+    if (!toId) {
+      console.error("Usage: bun cli.ts send <peer-id> <message> [--reply-to <msg-id>]");
+      process.exit(1);
+    }
+    // Strip --reply-to so the rest becomes the message text.
+    const { replyTo, rest } = takeReplyTo();
+    const msg = rest.slice(4).join(" ");
+    if (!msg) {
+      console.error("Usage: bun cli.ts send <peer-id> <message> [--reply-to <msg-id>]");
       process.exit(1);
     }
     try {
@@ -131,9 +174,14 @@ switch (cmd) {
         from_id: "cli",
         to_id: toId,
         text: msg,
+        reply_to: replyTo,
       });
       if (result.ok) {
-        console.log(`Message sent to ${toId}`);
+        if (replyTo != null) {
+          console.log(`Reply (to msg ${replyTo}) sent to ${toId}`);
+        } else {
+          console.log(`Message sent to ${toId}`);
+        }
       } else {
         console.error(`Failed: ${result.error}`);
       }
@@ -144,9 +192,11 @@ switch (cmd) {
   }
 
   case "broadcast": {
-    const msg = process.argv.slice(3).join(" ");
+    // Strip --reply-to so the rest becomes the message text.
+    const { replyTo, rest } = takeReplyTo();
+    const msg = rest.slice(3).join(" ");
     if (!msg) {
-      console.error("Usage: bun cli.ts broadcast <message> [--roles boss,worker]");
+      console.error("Usage: bun cli.ts broadcast <message> [--roles boss,worker] [--reply-to <msg-id>]");
       process.exit(1);
     }
     let roles: string[] | undefined;
@@ -158,10 +208,11 @@ switch (cmd) {
     try {
       const result = await brokerFetch<{ ok: boolean; count: number; delivered_to: string[]; error?: string }>(
         "/broadcast",
-        { from_id: "cli", text: msg, roles }
+        { from_id: "cli", text: msg, roles, reply_to: replyTo }
       );
       if (result.ok) {
-        console.log(`Broadcast delivered to ${result.count} peer(s): ${result.delivered_to.join(", ") || "(none)"}`);
+        const suffix = replyTo != null ? ` (as reply to msg ${replyTo})` : "";
+        console.log(`Broadcast${suffix} delivered to ${result.count} peer(s): ${result.delivered_to.join(", ") || "(none)"}`);
       } else {
         console.error(`Failed: ${result.error}`);
       }
@@ -217,7 +268,7 @@ switch (cmd) {
     }
     const direction = (process.argv[5] ?? "inbox") as "inbox" | "outbox" | "all";
     try {
-      const result = await brokerFetch<{ messages: Array<{ from_id: string; to_id: string; text: string; sent_at: string; expires_at: string | null }>; count: number }>(
+      const result = await brokerFetch<{ messages: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string; expires_at: string | null; reply_to: number | null }>; count: number }>(
         "/messages/history",
         { id, limit, direction }
       );
@@ -227,10 +278,45 @@ switch (cmd) {
         console.log(`${result.count} message(s) in ${direction} for ${id}:`);
         for (const m of result.messages) {
           const exp = m.expires_at ? ` (expires ${m.expires_at})` : "";
-          console.log(`  ${m.sent_at}  ${m.from_id} -> ${m.to_id}${exp}`);
+          const reply = m.reply_to != null ? `  (reply to ${m.reply_to})` : "";
+          console.log(`  [${m.id}] ${m.sent_at}  ${m.from_id} -> ${m.to_id}${exp}${reply}`);
           console.log(`    ${m.text}`);
         }
       }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    break;
+  }
+
+  case "thread": {
+    const idStr = process.argv[3];
+    if (!idStr) {
+      console.error("Usage: bun cli.ts thread <msg-id>");
+      process.exit(1);
+    }
+    const id = parseInt(idStr, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      console.error(`Error: msg-id must be a positive integer, got "${idStr}"`);
+      process.exit(1);
+    }
+    try {
+      const result = await brokerFetch<
+        | { root: { id: number; from_id: string; to_id: string; text: string; sent_at: string; reply_to: number | null }; replies: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string; reply_to: number | null }>; count: number }
+        | { error: string }
+      >("/messages/thread", { id });
+      if ("error" in result) {
+        console.error(`Failed: ${result.error}`);
+        process.exit(1);
+      }
+      const render = (m: { id: number; from_id: string; to_id: string; text: string; sent_at: string; reply_to: number | null }, prefix: string) => {
+        const reply = m.reply_to != null ? `  (reply to ${m.reply_to})` : "";
+        console.log(`${prefix}[${m.id}] ${m.sent_at}  ${m.from_id} -> ${m.to_id}${reply}`);
+        console.log(`${prefix}  ${m.text}`);
+      };
+      console.log(`Thread (${result.count} message${result.count === 1 ? "" : "s"}):`);
+      render(result.root, "");
+      for (const m of result.replies) render(m, "  ");
     } catch (e) {
       console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -280,13 +366,14 @@ switch (cmd) {
     console.log(`claude-peers CLI
 
 Usage:
-  bun cli.ts status                       Show broker status and all peers
-  bun cli.ts peers                        List all peers
-  bun cli.ts peers-by-role <role>         List peers filtered by role (boss/worker/reviewer/any)
-  bun cli.ts send <id> <msg>              Send a message to a peer
-  bun cli.ts broadcast <msg>              Broadcast a message to every peer
-  bun cli.ts set-role <id> <role>         Set a peer's role
-  bun cli.ts set-presence <id> <p>        Set a peer's presence string
-  bun cli.ts history <id> [limit] [dir]   Show recent message history (inbox|outbox|all)
-  bun cli.ts kill-broker                  Stop the broker daemon`);
+  bun cli.ts status                                Show broker status and all peers
+  bun cli.ts peers                                 List all peers
+  bun cli.ts peers-by-role <role>                  List peers filtered by role (boss/worker/reviewer/any)
+  bun cli.ts send <id> <msg> [--reply-to <id>]     Send a message (optionally as a reply)
+  bun cli.ts broadcast <msg> [--reply-to <id>]     Broadcast (optionally as a reply)
+  bun cli.ts set-role <id> <role>                  Set a peer's role
+  bun cli.ts set-presence <id> <p>                 Set a peer's presence string
+  bun cli.ts history <id> [limit] [dir]            Show recent message history (inbox|outbox|all; default 20, inbox)
+  bun cli.ts thread <msg-id>                       Show a full conversation thread
+  bun cli.ts kill-broker                           Stop the broker (uses lsof on Unix, netstat+taskkill on Windows)`);
 }

@@ -20,6 +20,7 @@ This is a fork of [louislva/claude-peers-mcp](https://github.com/louislva/claude
 - **Presence** — every peer carries a short free-form status string (e.g. `typing`, `idle`, `busy coding`) that surfaces in the channel and in `list_peers`
 - **Message history** — queryable inbox/outbox/all with configurable limit
 - **Message TTL** — auto-expiry of unread messages after a default of 24h (configurable, disable-able)
+- **Threaded replies** — every message can be a reply to another (`reply_to` field); `get_thread` MCP tool and `cli thread` reconstruct the full conversation tree in one call
 - **2-second polling** loop (was 1s) to reduce idle CPU while staying responsive
 - **Windows-native compatibility** — cross-platform PID liveness check, bun executable discovery, TTY detection, and `kill-broker` (`netstat` + `taskkill` instead of `lsof`)
 - **GitHub Actions CI** — typecheck, tests, and bundle build on Ubuntu, Windows, and macOS
@@ -66,12 +67,13 @@ The other Claude receives it immediately and responds.
 | ---------------------- | ------------------------------------------------------------------------------------- |
 | `list_peers`           | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` (optional `role` / `presence` filter) |
 | `list_peers_by_role`   | Find peers by their declared role (boss/worker/reviewer/any)                          |
-| `send_message`         | Send a message to another instance by ID (optional `ttl_seconds` override)            |
-| `broadcast_message`    | Send a message to every peer at once (optional role / include / exclude filters, optional `ttl_seconds`) |
+| `send_message`         | Send a message to another instance by ID (optional `ttl_seconds` and `reply_to` overrides)            |
+| `broadcast_message`    | Send a message to every peer at once (optional role / include / exclude filters, optional `ttl_seconds` and `reply_to`) |
 | `set_summary`          | Describe what you're working on (visible to other peers)                              |
 | `set_role`             | Declare your role in the agent team (boss/worker/reviewer/any)                        |
 | `set_presence`         | Update your free-form presence string (e.g. `typing`, `idle`, `busy`)                 |
 | `message_history`      | Fetch recent message history for a peer (`inbox` / `outbox` / `all`, with limit)      |
+| `get_thread`           | Fetch a full conversation thread by the id of any message in it (root or reply)       |
 | `check_messages`       | Manually check for messages (fallback if not using channel mode)                      |
 
 ## Roles: orchestrating multi-agent teams
@@ -112,6 +114,40 @@ Reviewers can be pinged separately:
 > send a review request to the reviewer peer
 ```
 
+## Threading: keeping conversations coherent
+
+When a boss asks a worker "fix bug #1, #2, #3" and the worker replies with three separate messages, the boss has no way to know which reply goes with which task. Threading fixes this: every message can carry a `reply_to` pointing at the message it answers.
+
+```
+👑 Boss → Worker: "fix bug #1, #2, #3"            [msg 42]
+👷 Worker → Boss: "fixed #1"   [reply_to: 42]     [msg 47]
+👷 Worker → Boss: "fixed #2"   [reply_to: 42]     [msg 48]
+👷 Worker → Boss: "fixed #3"   [reply_to: 42]     [msg 49]
+```
+
+In a boss:
+
+```
+> send_message to <worker> with reply_to=42: "fixed #1, but #2 needs more context"
+```
+
+The receiving Claude sees `reply_to: 42` in the channel push and can call `get_thread(49)` to reconstruct the full conversation (root + all replies) in chronological order. The CLI does the same:
+
+```bash
+bun cli.ts thread 49
+# Thread (4 messages):
+#   [42]  2026-06-03T...  u2hx9di0 -> 4jz98jgg
+#     fix bug #1, #2, #3
+#     [47]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
+#       fixed #1
+#     [48]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
+#       fixed #2
+#     [49]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
+#       fixed #3
+```
+
+Replies can nest: a reply to a reply is allowed, and `get_thread` walks the whole chain.
+
 ## How it works
 
 A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every 2 seconds. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
@@ -140,12 +176,13 @@ cd ~/claude-orc
 bun cli.ts status                       # broker status + all peers (shows TTL)
 bun cli.ts peers                        # list all peers (shows role + presence)
 bun cli.ts peers-by-role worker         # list peers with role "worker"
-bun cli.ts send <id> <msg>              # send a message into a Claude session
-bun cli.ts broadcast <msg>              # broadcast to every peer
+bun cli.ts send <id> <msg> [--reply-to N]  # send a message into a Claude session (optionally as a reply)
+bun cli.ts broadcast <msg> [--reply-to N]  # broadcast (optionally as a reply)
 bun cli.ts broadcast <msg> --roles worker  # broadcast to specific role
 bun cli.ts set-role <id> worker         # change a peer's role
 bun cli.ts set-presence <id> <string>   # set a peer's presence (e.g. "typing")
-bun cli.ts history <id> [limit] [dir]   # message history (inbox|outbox|all; default 10, all)
+bun cli.ts history <id> [limit] [dir]   # message history (inbox|outbox|all; default 20, inbox)
+bun cli.ts thread <msg-id>              # show a full conversation thread (root + replies)
 bun cli.ts kill-broker                  # stop the broker (uses lsof on Unix, netstat+taskkill on Windows)
 ```
 
@@ -189,9 +226,9 @@ CI runs on every push and pull request across `ubuntu-latest`, `windows-latest`,
 ## Backward compatibility
 
 - Same port (7899) and same DB file format.
-- The new `role`, `presence`, and `messages.expires_at` columns are added via `ALTER TABLE` on existing databases; default for `role` is `'any'`, `presence` is `''`, and `expires_at` is `NULL` (no expiry).
+- The new `role`, `presence`, and `messages.expires_at` columns are added via `ALTER TABLE` on existing databases; default for `role` is `'any'`, `presence` is `''`, and `expires_at` is `NULL` (no expiry). The new `messages.reply_to` column is added the same way.
 - All original endpoints (`/register`, `/heartbeat`, `/set-summary`, `/list-peers`, `/send-message`, `/poll-messages`, `/unregister`) and tools (`list_peers`, `send_message`, `set_summary`, `check_messages`) work unchanged.
-- New endpoints (`/set-role`, `/list-peers-by-role`, `/broadcast`, `/set-presence`, `/messages/history`) and tools (`set_role`, `list_peers_by_role`, `broadcast_message`, `set_presence`, `message_history`) are purely additive.
+- New endpoints (`/set-role`, `/list-peers-by-role`, `/broadcast`, `/set-presence`, `/messages/history`, `/messages/thread`) and tools (`set_role`, `list_peers_by_role`, `broadcast_message`, `set_presence`, `message_history`, `get_thread`) are purely additive.
 - `set_presence` and `message_history` are advertised in the MCP `tools` list, so any client that auto-discovers tools will see them.
 
 ## Requirements
