@@ -1,243 +1,202 @@
-# claude-orc (claude-peers fork)
+# claude-orc
 
-Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
+> **Multi-agent orchestration for Claude Code.**
+> A fork of [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) that adds roles, broadcast, presence, history, message TTL, threaded replies, and Windows-native support.
 
 ```
-  Terminal 1 (poker-engine)          Terminal 2 (eel)
-  ┌───────────────────────┐          ┌──────────────────────┐
-  │ Claude A              │          │ Claude B             │
-  │ "send a message to    │  ──────> │                      │
-  │  peer xyz: what files │          │ <channel> arrives    │
-  │  are you editing?"    │  <────── │  instantly, Claude B │
-  │                       │          │  responds            │
-  └───────────────────────┘          └──────────────────────┘
+   Boss                          Worker A                       Worker B
+   (role: boss)                  (role: worker)                 (role: worker)
+   ┌──────────┐   broadcast      ┌──────────┐                   ┌──────────┐
+   │ Claude   │ ───────────────> │ Claude   │                   │ Claude   │
+   │ "refactor│                  │ "on it"  │                   │          │
+   │  the X"  │   reply (47)     │          │                   │          │
+   │          │ <─────────────── │          │                   │          │
+   └──────────┘                  └──────────┘                   └──────────┘
+        │                                                             ▲
+        └──────────── broadcast ──────────────────────────────────────┘
+                          (one message → every worker)
 ```
 
-This is a fork of [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) that adds:
-
-- **Agent roles** (`boss` / `worker` / `reviewer` / `any`) for orchestrating multi-agent teams
-- **`broadcast_message`** tool to message every peer (optionally filtered by role)
-- **Presence** — every peer carries a short free-form status string (e.g. `typing`, `idle`, `busy coding`) that surfaces in the channel and in `list_peers`
-- **Message history** — queryable inbox/outbox/all with configurable limit
-- **Message TTL** — auto-expiry of unread messages after a default of 24h (configurable, disable-able)
-- **Threaded replies** — every message can be a reply to another (`reply_to` field); `get_thread` MCP tool and `cli thread` reconstruct the full conversation tree in one call
-- **2-second polling** loop (was 1s) to reduce idle CPU while staying responsive
-- **Windows-native compatibility** — cross-platform PID liveness check, bun executable discovery, TTY detection, and `kill-broker` (`netstat` + `taskkill` instead of `lsof`)
-- **GitHub Actions CI** — typecheck, tests, and bundle build on Ubuntu, Windows, and macOS
-
-Fully backward compatible with the original `claude-peers`. Same port (7899), same DB schema (the new `role` column is added via `ALTER TABLE` on existing databases), all original tools and endpoints still work.
+When you're running several Claude Code sessions at once — one per repo, one per worktree, one as a reviewer, one as an orchestrator — **claude-orc** lets them find each other and talk. The boss can broadcast a task to every worker, the worker can reply in a thread, the reviewer can see the presence string ("typing", "busy", "reviewing") before pinging. All over a tiny local HTTP broker with SQLite, no cloud, no accounts.
 
 ## Quick start
 
-### 1. Install
-
 ```bash
+# 1. Install Bun (if you don't have it)
+curl -fsSL https://bun.sh/install | bash
+
+# 2. Clone and install
 git clone https://github.com/JonusNattapong/claude-orc-mcp.git ~/claude-orc
 cd ~/claude-orc
 bun install
-```
 
-### 2. Register the MCP server
-
-```bash
+# 3. Register the MCP server
 claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-orc/server.ts
-```
 
-### 3. Run Claude Code with the channel
-
-```bash
+# 4. Start Claude Code with the channel enabled (do this in every session)
 claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
 ```
 
-### 4. Open a second session and try it
-
-In another terminal, start Claude Code the same way. Then ask either one:
+Open a second terminal and run the same command. Then in either session:
 
 > List all peers on this machine
 
-It'll show every running instance with their working directory, git repo, role, and summary. Then:
+You'll see every running instance. Then:
 
-> Send a message to peer [id]: "what are you working on?"
+> Send a message to peer `[id]`: "what are you working on?"
 
-The other Claude receives it immediately and responds.
+The other Claude receives it **instantly** via Claude Code's channel protocol.
 
-## What Claude can do
+## What's new vs upstream `claude-peers`
 
-| Tool                   | What it does                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------- |
-| `list_peers`           | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` (optional `role` / `presence` filter) |
-| `list_peers_by_role`   | Find peers by their declared role (boss/worker/reviewer/any)                          |
-| `send_message`         | Send a message to another instance by ID (optional `ttl_seconds` and `reply_to` overrides)            |
-| `broadcast_message`    | Send a message to every peer at once (optional role / include / exclude filters, optional `ttl_seconds` and `reply_to`) |
-| `set_summary`          | Describe what you're working on (visible to other peers)                              |
-| `set_role`             | Declare your role in the agent team (boss/worker/reviewer/any)                        |
-| `set_presence`         | Update your free-form presence string (e.g. `typing`, `idle`, `busy`)                 |
-| `message_history`      | Fetch recent message history for a peer (`inbox` / `outbox` / `all`, with limit)      |
-| `get_thread`           | Fetch a full conversation thread by the id of any message in it (root or reply)       |
-| `check_messages`       | Manually check for messages (fallback if not using channel mode)                      |
+| Feature | What it does |
+|---|---|
+| **Agent roles** | Tag yourself as `boss` / `worker` / `reviewer` / `any` so peers can find you by team position |
+| **Broadcast** | Send a message to every peer at once, optionally filtered by role / include / exclude |
+| **Presence** | A short free-form status string (`typing`, `idle`, `busy coding`) that surfaces in `list_peers` and the channel push |
+| **Message history** | Queryable `inbox` / `outbox` / `all` with limit and `since` filter — catch up after downtime |
+| **Message TTL** | Auto-expire unread messages after 24h (configurable, `0` = never expire) |
+| **Threaded replies** | Every message can carry `reply_to`; `get_thread` walks the chain to rebuild a full conversation tree |
+| **2s polling** | (was 1s) lower idle CPU while still feeling instant via channel push |
+| **Windows native** | Cross-platform PID liveness, TTY via `wmic`, `kill-broker` via `netstat`+`taskkill`. No WSL needed |
+| **CI** | GitHub Actions matrix: typecheck + 49 tests + bundle build on Ubuntu, Windows, macOS |
 
-## Roles: orchestrating multi-agent teams
+All additive — the original endpoints, tools, and DB schema are preserved (new columns added via `ALTER TABLE`).
 
-A typical orchestrator pattern:
-
-```
-  ┌────────────┐    broadcast_message(roles=["worker"])    ┌────────────┐
-  │  Claude A  │ ───────────────────────────────────────> │  Claude B  │
-  │  (boss)    │                                            │  (worker)  │
-  │            │    broadcast_message(roles=["worker"])    │            │
-  │            │ ───────────────────────────────────────> │  Claude C  │
-  │            │                                            │  (worker)  │
-  │            │ <─────────────────────────────────────── │            │
-  │            │    send_message(from_id=...)              │            │
-  │            │ <─────────────────────────────────────── │            │
-  └────────────┘                                            └────────────┘
-```
-
-In a "boss" agent, declare the role and broadcast work:
+## Multi-agent pattern: boss + workers with threads
 
 ```
-> set my role to "boss"
-> broadcast "Task A: refactor the auth module. Reply when done" with roles=["worker"]
-> broadcast "Task B: write tests for the new endpoint" with roles=["worker"]
+   👑 Boss (role: boss)            👷 Worker A                👷 Worker B
+        │                              │                          │
+        │  broadcast "fix #1, #2, #3"  │                          │
+        │  ─────────────────────────>  │                          │
+        │  ────────────────────────────────────────────────────>  │
+        │  [msg 42]                     [msg 42]                  [msg 42]
+        │                              │                          │
+        │                       "fixed #1" (reply_to: 42)         │
+        │                       [msg 47]                          │
+        │ <─────────────────────────────────                      │
+        │                              │                  "fixed #2" (reply_to: 42)
+        │                              │                  [msg 48]
+        │ <───────────────────────────────────────────────────── │
+        │                              │                          │
+        │  get_thread(47)  ──>  reconciles the full chain in one call
 ```
 
-Workers declare their role and listen for broadcasts:
+In a boss session:
 
-```
-> set my role to "worker"
-```
+> Set my role to "boss".
+> Broadcast: "fix bug #1, #2, #3" with roles=["worker"].
+> (later) Get thread 47 to see the full context.
 
-Reviewers can be pinged separately:
+In a worker session:
 
-```
-> list peers with role "reviewer"
-> send a review request to the reviewer peer
-```
+> Set my role to "worker".
+> Send message to `<boss>` with reply_to=42: "fixed #1, but #2 needs more context".
 
-## Threading: keeping conversations coherent
+The boss gets the reply with `reply_to: 42` in the channel payload, calls `get_thread(47)`, and sees the original ask plus all the worker replies in order — no more guessing which message answered which task.
 
-When a boss asks a worker "fix bug #1, #2, #3" and the worker replies with three separate messages, the boss has no way to know which reply goes with which task. Threading fixes this: every message can carry a `reply_to` pointing at the message it answers.
+## Tools (MCP)
 
-```
-👑 Boss → Worker: "fix bug #1, #2, #3"            [msg 42]
-👷 Worker → Boss: "fixed #1"   [reply_to: 42]     [msg 47]
-👷 Worker → Boss: "fixed #2"   [reply_to: 42]     [msg 48]
-👷 Worker → Boss: "fixed #3"   [reply_to: 42]     [msg 49]
-```
-
-In a boss:
-
-```
-> send_message to <worker> with reply_to=42: "fixed #1, but #2 needs more context"
-```
-
-The receiving Claude sees `reply_to: 42` in the channel push and can call `get_thread(49)` to reconstruct the full conversation (root + all replies) in chronological order. The CLI does the same:
-
-```bash
-bun cli.ts thread 49
-# Thread (4 messages):
-#   [42]  2026-06-03T...  u2hx9di0 -> 4jz98jgg
-#     fix bug #1, #2, #3
-#     [47]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
-#       fixed #1
-#     [48]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
-#       fixed #2
-#     [49]  2026-06-03T...  4jz98jgg -> u2hx9di0  (reply to 42)
-#       fixed #3
-```
-
-Replies can nest: a reply to a reply is allowed, and `get_thread` walks the whole chain.
-
-## How it works
-
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every 2 seconds. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
-
-```
-                    ┌───────────────────────────┐
-                    │  broker daemon            │
-                    │  localhost:7899 + SQLite  │
-                    └──────┬───────────────┬────┘
-                           │               │
-                      MCP server A    MCP server B
-                      (stdio)         (stdio)
-                           │               │
-                      Claude A         Claude B
-```
-
-The broker auto-launches when the first session starts. It cleans up dead peers automatically (cross-platform PID check — `process.kill(pid, 0)` with an EPERM-tolerant fallback). Everything is localhost-only.
+| Tool | Purpose |
+|---|---|
+| `list_peers` | Discover peers (`machine` / `directory` / `repo` scope, optional `role`/`presence` filter) |
+| `list_peers_by_role` | Find peers by declared role |
+| `send_message` | Send to one peer (optional `ttl_seconds`, `reply_to`) |
+| `broadcast_message` | Send to every peer (optional roles / include / exclude, `reply_to`) |
+| `set_summary` | Describe what you're working on |
+| `set_role` | Declare your team role |
+| `set_presence` | Set a short status string |
+| `message_history` | Past messages (inbox/outbox/all, with limit) |
+| `get_thread` | Reconstruct a full conversation thread |
+| `check_messages` | Manual poll (normally the channel push handles it) |
 
 ## CLI
 
-Inspect and interact from the command line:
-
 ```bash
-cd ~/claude-orc
-
-bun cli.ts status                       # broker status + all peers (shows TTL)
-bun cli.ts peers                        # list all peers (shows role + presence)
-bun cli.ts peers-by-role worker         # list peers with role "worker"
-bun cli.ts send <id> <msg> [--reply-to N]  # send a message into a Claude session (optionally as a reply)
-bun cli.ts broadcast <msg> [--reply-to N]  # broadcast (optionally as a reply)
-bun cli.ts broadcast <msg> --roles worker  # broadcast to specific role
-bun cli.ts set-role <id> worker         # change a peer's role
-bun cli.ts set-presence <id> <string>   # set a peer's presence (e.g. "typing")
-bun cli.ts history <id> [limit] [dir]   # message history (inbox|outbox|all; default 20, inbox)
-bun cli.ts thread <msg-id>              # show a full conversation thread (root + replies)
-bun cli.ts kill-broker                  # stop the broker (uses lsof on Unix, netstat+taskkill on Windows)
+bun cli.ts status                              # broker status + all peers
+bun cli.ts peers                               # list all peers
+bun cli.ts peers-by-role worker                # find workers
+bun cli.ts send <id> <msg> [--reply-to N]      # send (optionally as a reply)
+bun cli.ts broadcast <msg> [--roles r,r] [--reply-to N]
+bun cli.ts set-role <id> worker
+bun cli.ts set-presence <id> "reviewing"
+bun cli.ts history <id> [limit] [inbox|outbox|all]
+bun cli.ts thread <msg-id>                     # full conversation tree
+bun cli.ts kill-broker
 ```
 
-## Windows compatibility
+## How it works
 
-The original `claude-peers` used Unix-only tools (`lsof`, `ps -o tty=`) for PID liveness and TTY detection. This fork:
+```
+                     ┌──────────────────────────┐
+                     │   broker daemon          │
+                     │   127.0.0.1:7899         │
+                     │   Bun.serve + SQLite     │
+                     └────┬──────────────┬──────┘
+                          │              │
+                     HTTP POST      HTTP POST
+                          │              │
+                    ┌─────┴───┐     ┌────┴────┐
+                    │ server  │     │ server  │   ← one MCP stdio per Claude session
+                    │  .ts    │     │  .ts    │
+                    └────┬────┘     └────┬────┘
+                         │              │
+                       Claude A      Claude B
+                       (channel)     (channel)
+```
 
-- Replaces `process.kill(pid, 0)` with a cross-platform helper (`shared/platform.ts`) that handles `EPERM` (process exists but we can't signal it).
-- Detects TTY via `wmic` on Windows, falls back gracefully.
-- Resolves the `bun` executable (handles `bun.exe` / `bun.cmd` on Windows).
-- `kill-broker` uses `netstat -ano` + `taskkill /F /PID` on Windows, `lsof` on Unix.
-
-Tested on Windows 11 native (not WSL).
-
-## Auto-summary
-
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). Without the API key, Claude sets its own summary via the `set_summary` tool.
+- The broker **auto-launches** on the first session. It exits when no peers are left.
+- Each session registers its PID + cwd + git root + tty + summary, then **polls every 2s** for new messages.
+- Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol so Claude sees them **immediately** without waiting for the next user turn.
+- The broker reaps dead PIDs cross-platform (handles `EPERM` on Windows).
+- Everything is **localhost-only** — no network exposure.
 
 ## Configuration
 
-| Environment variable              | Default              | Description                                                |
-| --------------------------------- | -------------------- | ---------------------------------------------------------- |
-| `CLAUDE_PEERS_PORT`               | `7899`               | Broker port                                                |
-| `CLAUDE_PEERS_DB`                 | `~/.claude-peers.db` | SQLite database path                                       |
-| `CLAUDE_PEERS_MESSAGE_TTL_HOURS`  | `24`                 | Default message TTL in hours (`0` disables expiry)         |
-| `OPENAI_API_KEY`                  | —                    | Enables auto-summary via gpt-5.4-nano                      |
+| Env var | Default | Purpose |
+|---|---|---|
+| `CLAUDE_PEERS_PORT` | `7899` | Broker port |
+| `CLAUDE_PEERS_DB` | `~/.claude-peers.db` | SQLite database file |
+| `CLAUDE_PEERS_MESSAGE_TTL_HOURS` | `24` | Unread message expiry (`0` disables) |
+| `OPENAI_API_KEY` | — | Enables auto-summary via `gpt-5.4-nano` on startup |
+
+## Windows
+
+Tested on Windows 11 native (not WSL). The original `claude-peers` used `lsof` and `ps -o tty=` which don't exist on Windows; this fork:
+
+- Replaces `process.kill(pid, 0)` with a cross-platform `isProcessAlive()` helper in `shared/platform.ts` (handles `EPERM`).
+- Detects TTY via `wmic`, falls back gracefully.
+- `kill-broker` uses `netstat -ano` + `taskkill /F /PID`.
+- Resolves `bun.exe` / `bun.cmd` / `bun` on PATH.
 
 ## Development
 
 ```bash
-bun test                              # run all tests
-bun test tests/broker.test.ts         # run a single file
+bun test                              # 49 tests across 6 files
+bun test tests/threading.test.ts      # just the threading suite
 bunx tsc --noEmit                     # typecheck
 bun broker.ts                         # run broker standalone
 bun run build                         # build dist/{broker,server,cli}.js
 bun run prepublishOnly                # typecheck + test + build (CI parity)
 ```
 
-CI runs on every push and pull request across `ubuntu-latest`, `windows-latest`, and `macos-latest` (Bun 1.3.x, frozen lockfile), and uploads the bundled `dist/` artifacts on every build.
+CI runs on every push and PR across `ubuntu-latest`, `windows-latest`, and `macos-latest` (Bun 1.3.x, frozen lockfile), and uploads the bundled `dist/` artifacts.
 
 ## Backward compatibility
 
 - Same port (7899) and same DB file format.
-- The new `role`, `presence`, and `messages.expires_at` columns are added via `ALTER TABLE` on existing databases; default for `role` is `'any'`, `presence` is `''`, and `expires_at` is `NULL` (no expiry). The new `messages.reply_to` column is added the same way.
-- All original endpoints (`/register`, `/heartbeat`, `/set-summary`, `/list-peers`, `/send-message`, `/poll-messages`, `/unregister`) and tools (`list_peers`, `send_message`, `set_summary`, `check_messages`) work unchanged.
-- New endpoints (`/set-role`, `/list-peers-by-role`, `/broadcast`, `/set-presence`, `/messages/history`, `/messages/thread`) and tools (`set_role`, `list_peers_by_role`, `broadcast_message`, `set_presence`, `message_history`, `get_thread`) are purely additive.
-- `set_presence` and `message_history` are advertised in the MCP `tools` list, so any client that auto-discovers tools will see them.
+- New columns (`role`, `presence`, `messages.expires_at`, `messages.reply_to`) are added via `ALTER TABLE` on existing databases; defaults keep old clients working.
+- Original endpoints (`/register`, `/heartbeat`, `/set-summary`, `/list-peers`, `/send-message`, `/poll-messages`, `/unregister`) and tools (`list_peers`, `send_message`, `set_summary`, `check_messages`) are unchanged.
+- New endpoints and tools are purely additive and advertised in the MCP `tools` list.
 
 ## Requirements
 
-- [Bun](https://bun.sh)
+- [Bun](https://bun.sh) 1.3+
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
-- Windows, macOS, or Linux (cross-platform)
+- A `claude.ai` login (channels require it — API-key auth won't work)
+- Windows, macOS, or Linux
 
 ## License
 
-MIT (same as upstream).
+MIT — same as upstream.
