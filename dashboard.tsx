@@ -6,7 +6,7 @@ const BROKER_PORT = parseInt(process.env.CLEW_ORC_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_MS = 3000;
 
-type Peer = { id: string; pid: number; cwd: string; git_root: string | null; summary: string; role: string; presence: string; source: string; last_seen: string };
+type Peer = { id: string; pid: number; cwd: string; git_root: string | null; summary: string; role: string; presence: string; source: string; last_seen: string; has_channel?: boolean };
 type Board = { id: number; name: string; description: string; created_at: string };
 type BoardTask = { id: number; title: string; status: string; assigned_to: string | null; description: string };
 type Kanban = { board: Board; todo: BoardTask[]; in_progress: BoardTask[]; done: BoardTask[]; blocked: BoardTask[] };
@@ -73,8 +73,8 @@ function PeerList({ peers, selectedPath, pathIndex, groups: _g }: { peers: Peer[
       <Text bold color="yellow">Path: </Text>
       <Text bold>{selectedPath}</Text>
       <Box flexDirection="column" marginTop={1}>
-        <Text bold color="cyan">{"     ID        ROLE     PRESENCE   STATUS     LAST SEEN"}</Text>
-        <Text dimColor>{"  ───────────────────────────────────────────────────────"}</Text>
+        <Text bold color="cyan">{"     ID        ROLE     PRESENCE   PUSH   STATUS     LAST SEEN"}</Text>
+        <Text dimColor>{"  ──────────────────────────────────────────────────────────────"}</Text>
         {group.peers.slice(0, 25).map((p) => (
           <Box key={p.id} flexDirection="column">
             <Text>
@@ -82,7 +82,8 @@ function PeerList({ peers, selectedPath, pathIndex, groups: _g }: { peers: Peer[
               <Text>{` ${p.id.slice(0, 10)}`}</Text>
               {p.source === "mcp" ? <Text color="yellow">{" MCP "}</Text> : <Text>{"    "}</Text>}
               <Text dimColor>{` ${p.role.padEnd(8)}`}</Text>
-              <Text dimColor>{` ${(p.presence || "-").padEnd(9)}`}</Text>
+              <Text dimColor>{` ${(p.presence || "-").padEnd(10)}`}</Text>
+              <Text color={p.has_channel ? "cyan" : "gray"}>{p.has_channel ? "yes ".padEnd(6) : "no  ".padEnd(6)}</Text>
               <Text color={isAlive(p.last_seen) ? "green" : "red"}>{isAlive(p.last_seen) ? "alive".padEnd(9) : "offline".padEnd(9)}</Text>
               <Text dimColor>{timeAgo(p.last_seen)}</Text>
             </Text>
@@ -107,7 +108,7 @@ function BoardKanban() {
   const [selectedBoard, setSelectedBoard] = useState<number | null>(null);
   const [kanban, setKanban] = useState<Kanban | null>(null);
   useEffect(() => { const t = setInterval(async () => { const b = await brokerFetch<{ boards: Board[] }>("/board/list", {}); if (b) setBoards(b.boards); }, POLL_MS * 2); return () => clearInterval(t); }, []);
-  useEffect(() => { if (!selectedBoard && boards.length > 0) setSelectedBoard(boards[0].id); }, [boards, selectedBoard]);
+  useEffect(() => { if (!selectedBoard && boards.length > 0 && boards[0]) setSelectedBoard(boards[0].id); }, [boards, selectedBoard]);
   useEffect(() => { if (!selectedBoard) return; const t = setInterval(async () => { const k = await brokerFetch<Kanban>("/board/task/kanban", { board_id: selectedBoard }); if (k && "board" in k) setKanban(k as Kanban); }, POLL_MS); return () => clearInterval(t); }, [selectedBoard]);
   if (boards.length === 0) return <Text dimColor>No boards yet.</Text>;
 
@@ -152,7 +153,7 @@ function MessagesView({
         <Text dimColor>Online: </Text>
         {allPeers.length === 0 ? <Text dimColor>none</Text> : allPeers.slice(0, 10).map((p) => {
           const alive = (Date.now() - new Date(p.last_seen).getTime()) < 30000;
-          return <Text key={p.id} marginRight={1}><Text color={alive ? "green" : "red"}>{alive ? "●" : "○"}</Text><Text dimColor>{`${p.id.slice(0, 6)} `}</Text></Text>;
+          return <Box key={p.id} marginRight={1}><Text color={alive ? "green" : "red"}>{alive ? "●" : "○"}</Text><Text dimColor>{` ${p.id.slice(0, 6)}`}</Text></Box>;
         })}
       </Box>
 
@@ -212,11 +213,8 @@ function App() {
   useEffect(() => {
     if (composing) return;
     const t = setInterval(async () => {
-      const p = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: "/", git_root: null });
-      if (p && p.length > 0) {
-        const hist = await brokerFetch<{ messages: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string }> }>("/messages/history", { id: p[0].id, limit: 30, direction: "all" });
-        if (hist) setMsgs(hist.messages);
-      }
+      const hist = await brokerFetch<{ messages: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string }> }>("/messages/history", { id: "dashboard", limit: 30, direction: "global" });
+      if (hist) setMsgs(hist.messages);
     }, POLL_MS);
     return () => clearInterval(t);
   }, [composing]);
@@ -252,7 +250,7 @@ function App() {
       if (key.tab) {
         const next = (composeTargetIdx + 1) % chatTargets.length;
         setComposeTargetIdx(next);
-        setComposeTarget(chatTargets[next]);
+        setComposeTarget(chatTargets[next] ?? "* (broadcast)");
         return;
       }
       if (_input.length === 1 && _input >= " ") { setComposeInput((s) => s + _input); return; }
@@ -264,7 +262,7 @@ function App() {
       if (!selectedPath) {
         if (key.upArrow) setPathIndex((i) => Math.max(0, i - 1));
         if (key.downArrow) setPathIndex((i) => Math.min(groups.length - 1, i + 1));
-        if (key.return && groups.length > 0) setSelectedPath(groups[pathIndex].cwd);
+        if (key.return && groups[pathIndex]) setSelectedPath(groups[pathIndex].cwd);
       } else { if (key.escape) setSelectedPath(null); }
     }
 

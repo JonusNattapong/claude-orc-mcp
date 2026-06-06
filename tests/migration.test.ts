@@ -142,7 +142,7 @@ describe("schema migration: legacy DB without `role` column", () => {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
       // Use process.pid so the row survives the broker's startup cleanup.
-      insert.run("legacy01", process.pid, "/tmp/legacy-seed", null, null, "old peer", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z");
+      insert.run("legacy01", process.pid, "/tmp/legacy-seed", null, null, "old peer", "2024-01-01T00:00:00Z", new Date().toISOString());
       db.close();
     });
 

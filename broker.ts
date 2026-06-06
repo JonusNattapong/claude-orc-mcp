@@ -75,7 +75,7 @@ function getDefaultDbPath(): string {
 const DB_PATH = getDefaultDbPath();
 const MESSAGE_TTL_HOURS = Math.max(0, parseFloat(process.env.CLEW_ORC_TTL_HOURS ?? process.env.CLAUDE_PEERS_MESSAGE_TTL_HOURS ?? "24"));
 // Cleanup interval: every 5 minutes.
-const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 30 * 1000;
 
 // --- Database setup ---
 
@@ -94,7 +94,8 @@ db.run(`
     role TEXT NOT NULL DEFAULT 'any',
     presence TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    has_channel INTEGER NOT NULL DEFAULT 0
   )
 `);
 
@@ -117,6 +118,9 @@ db.run(`
   }
   if (!cols.has("source")) {
     db.run("ALTER TABLE peers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+  }
+  if (!cols.has("has_channel")) {
+    db.run("ALTER TABLE peers ADD COLUMN has_channel INTEGER NOT NULL DEFAULT 0");
   }
 }
 
@@ -190,11 +194,18 @@ db.run("CREATE INDEX IF NOT EXISTS idx_board_tasks_assigned ON board_tasks(assig
 // --- Periodic cleanup ---
 
 function cleanStalePeers() {
+  // Remove peers that haven't heartbeated in 60s (stale even if PID exists)
+  // Keep undelivered messages — they should persist for reconnect
+  const staleCutoff = new Date(Date.now() - 60_000).toISOString();
+  db.run("DELETE FROM peers WHERE source = 'mcp' OR last_seen < ?", [staleCutoff]);
+
+  // Check PID liveness — delete DEAD peers (but PRESERVE their undelivered messages)
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
     if (!isProcessAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      // NOTE: intentionally NOT deleting undelivered messages here
+      // so reconnecting peers can catch up via global poll
     }
   }
 }
@@ -218,8 +229,8 @@ setInterval(() => {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, role, presence, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, role, presence, registered_at, last_seen, has_channel)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -302,6 +313,14 @@ const selectHistoryAll = db.prepare(`
   SELECT * FROM messages
   WHERE (from_id = ? OR to_id = ?)
     AND (expires_at IS NULL OR expires_at > ?)
+    AND (? IS NULL OR sent_at > ?)
+  ORDER BY sent_at DESC, id DESC
+  LIMIT ?
+`);
+
+const selectHistoryGlobal = db.prepare(`
+  SELECT * FROM messages
+  WHERE (expires_at IS NULL OR expires_at > ?)
     AND (? IS NULL OR sent_at > ?)
   ORDER BY sent_at DESC, id DESC
   LIMIT ?
@@ -392,6 +411,7 @@ function rowToPeer(row: Record<string, unknown>): Peer {
     source: String(row.source ?? "local"),
     registered_at: String(row.registered_at),
     last_seen: String(row.last_seen),
+    has_channel: !!row.has_channel,
   };
 }
 
@@ -412,6 +432,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const now = new Date().toISOString();
   const role = coerceRole(body.role);
   const presence = coercePresence(body.presence);
+  const hasChannel = body.has_channel ? 1 : 0;
 
   // Remove any existing registration for this PID (re-registration)
   const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
@@ -419,15 +440,30 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, role, presence, now, now);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, role, presence, now, now, hasChannel);
   return { id };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  if (body.presence !== undefined) {
+  const hasChannel = body.has_channel !== undefined ? (body.has_channel ? 1 : 0) : null;
+
+  if (body.presence !== undefined && hasChannel !== null) {
+    db.run("UPDATE peers SET last_seen = ?, presence = ?, has_channel = ? WHERE id = ?", [
+      new Date().toISOString(),
+      coercePresence(body.presence),
+      hasChannel,
+      body.id,
+    ]);
+  } else if (body.presence !== undefined) {
     db.run("UPDATE peers SET last_seen = ?, presence = ? WHERE id = ?", [
       new Date().toISOString(),
       coercePresence(body.presence),
+      body.id,
+    ]);
+  } else if (hasChannel !== null) {
+    db.run("UPDATE peers SET last_seen = ?, has_channel = ? WHERE id = ?", [
+      new Date().toISOString(),
+      hasChannel,
       body.id,
     ]);
   } else {
@@ -460,7 +496,7 @@ function handleSetPresence(body: SetPresenceRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
-function handleSetName(body: { id: string; name: string }): { ok: boolean; error?: string } {
+function handleSetName(body: { id: string; name: string }): { ok: boolean; error?: string; name?: string } {
   const target = selectPeerById.get(body.id) as { id: string } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.id} not found` };
@@ -638,18 +674,24 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const now = new Date().toISOString();
   let messages: Message[];
 
-  if (body.since) {
+  if (body.global) {
+    // Return ALL undelivered messages (catch orphaned messages after reconnect)
+    // Only mark messages as delivered if they're actually addressed to this peer
+    const rows = db
+      .query<Message, [string]>(
+        `SELECT * FROM messages WHERE delivered = 0 AND (expires_at IS NULL OR expires_at > ?) ORDER BY sent_at ASC`,
+      )
+      .all(now);
+    messages = rows.filter(m => m.to_id === body.id);
+    // Keep orphaned messages (to_id !== current ID) undelivered
+    for (const msg of messages) markDelivered.run(msg.id);
+    // Return ALL undelivered (including orphaned) for visibility
+    return { messages: rows };
+  } else if (body.since) {
     // Custom filter: undelivered + to_id + not expired + sent_at > since
     const rows = db
-      .query<
-        Message,
-        [string, string, string]
-      >(
-        `SELECT * FROM messages
-         WHERE to_id = ? AND delivered = 0
-           AND (expires_at IS NULL OR expires_at > ?)
-           AND sent_at > ?
-         ORDER BY sent_at ASC`
+      .query<Message, [string, string, string]>(
+        `SELECT * FROM messages WHERE to_id = ? AND delivered = 0 AND (expires_at IS NULL OR expires_at > ?) AND sent_at > ? ORDER BY sent_at ASC`,
       )
       .all(body.id, now, body.since);
     messages = rows;
@@ -657,8 +699,10 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
     messages = selectUndelivered.all(body.id, now) as Message[];
   }
 
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  if (!body.global) {
+    for (const msg of messages) {
+      markDelivered.run(msg.id);
+    }
   }
 
   return { messages };
@@ -675,6 +719,8 @@ function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryRespon
     rows = selectHistoryInbox.all(body.id, now, since, since, limit) as Message[];
   } else if (direction === "outbox") {
     rows = selectHistoryOutbox.all(body.id, now, since, since, limit) as Message[];
+  } else if (direction === "global") {
+    rows = selectHistoryGlobal.all(now, since, since, limit) as Message[];
   } else {
     rows = selectHistoryAll.all(body.id, body.id, now, since, since, limit) as Message[];
   }
@@ -782,7 +828,7 @@ function handleUpdateBoardTask(body: UpdateBoardTaskRequest): { ok: boolean; err
 
   const now = new Date().toISOString();
   const updates: string[] = ["updated_at = ?"];
-  const params: unknown[] = [now];
+  const params: any[] = [now];
 
   if (body.title !== undefined) { updates.push("title = ?"); params.push(body.title); }
   if (body.description !== undefined) { updates.push("description = ?"); params.push(body.description); }
@@ -796,7 +842,7 @@ function handleUpdateBoardTask(body: UpdateBoardTaskRequest): { ok: boolean; err
 
 function handleListBoardTasks(body: ListBoardTasksRequest): { tasks: BoardTask[] } {
   let sql = "SELECT * FROM board_tasks WHERE board_id = ?";
-  const params: unknown[] = [body.board_id];
+  const params: any[] = [body.board_id];
 
   if (body.status) { sql += " AND status = ?"; params.push(body.status); }
   if (body.assigned_to) { sql += " AND assigned_to = ?"; params.push(body.assigned_to); }
@@ -911,6 +957,11 @@ Bun.serve({
           return Response.json(handleKanban(body as { board_id: number }));
 
         // --- Remote MCP federation ---
+        case "/messages/all":
+          return Response.json(db.query("SELECT * FROM messages ORDER BY sent_at DESC LIMIT 50").all());
+        case "/cleanup":
+          cleanStalePeers();
+          return Response.json({ ok: true, peers: (selectAllPeers.all() as Peer[]).length });
         case "/remote/sync":
           return Response.json(handleRemoteSync(body as { token: string; peers: Peer[] }));
         case "/remote/info":

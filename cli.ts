@@ -48,11 +48,13 @@ type PeerRow = {
   role: string;
   presence: string;
   last_seen: string;
+  has_channel?: boolean;
 };
 
 function printPeer(p: PeerRow): void {
   const presenceStr = p.presence ? ` [${p.presence}]` : "";
-  console.log(`  ${p.id}  PID:${p.pid}  role:${p.role}${presenceStr}  ${p.cwd}`);
+  const pushStr = p.has_channel ? " [Push: OK]" : " [Push: No]";
+  console.log(`  ${p.id}  PID:${p.pid}  role:${p.role}${presenceStr}${pushStr}  ${p.cwd}`);
   if (p.summary) console.log(`         ${p.summary}`);
   if (p.tty) console.log(`         TTY: ${p.tty}`);
   console.log(`         Last seen: ${p.last_seen}`);
@@ -338,12 +340,7 @@ switch (cmd) {
   }
 
   case "aliases": {
-    try {
-      const { getAllAliases, formatAliases } = await import("./shared/aliases.ts");
-      console.log(formatAliases());
-    } catch {
-      console.log("No aliases module.");
-    }
+    console.log("No aliases module.");
     break;
   }
 
@@ -412,7 +409,7 @@ switch (cmd) {
             else console.error(`Remote broker not reachable at ${remoteUrl}: ${errText}`);
             break;
           }
-          const info = await infoRes.json();
+          const info = await infoRes.json() as { host: string; port: number; peer_count: number };
           const protocol = remoteUrl.startsWith("https") ? "TLS" : "HTTP";
           console.log(`Remote broker [${protocol}]: ${info.host}:${info.port} (${info.peer_count} peers)`);
 
@@ -433,7 +430,7 @@ switch (cmd) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ token, peers: remotePeers }),
           });
-          const syncResult = await syncRes.json();
+          const syncResult = await syncRes.json() as { ok: boolean; count?: number; error?: string };
           if (syncResult.ok) {
             console.log(`Synced ${syncResult.count} remote peer(s) from ${remoteUrl}`);
             console.log("Dashboard will show them with [MCP] tag");
@@ -449,7 +446,7 @@ switch (cmd) {
       case "info": {
         try {
           const res = await fetch(`http://127.0.0.1:${parseInt(process.env.CLEW_ORC_PORT ?? "7899", 10)}/remote/info`);
-          const info = await res.json();
+          const info = await res.json() as { host: string; port: number; peer_count: number };
           console.log(`Local broker: ${info.host}:${info.port} (${info.peer_count} peers)`);
         } catch {
           console.log("Local broker not reachable.");
@@ -488,7 +485,7 @@ switch (cmd) {
         break;
       }
       case "task": {
-        const bid = parseInt(args[0], 10);
+        const bid = parseInt(args[0] ?? "", 10);
         const title = args.slice(1).join(" ");
         if (!bid || !title) { console.error("Usage: bun cli.ts board task <board-id> <title> [--assign-to <peer-id>]"); process.exit(1); }
         const assignIdx = process.argv.indexOf("--assign-to");
@@ -500,7 +497,7 @@ switch (cmd) {
         break;
       }
       case "tasks": {
-        const bid = parseInt(args[0], 10);
+        const bid = parseInt(args[0] ?? "", 10);
         if (!bid) { console.error("Usage: bun cli.ts board tasks <board-id> [--status <status>]"); process.exit(1); }
         const sIdx = process.argv.indexOf("--status");
         const status = sIdx > 0 ? process.argv[sIdx + 1] : undefined;

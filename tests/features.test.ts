@@ -385,7 +385,7 @@ describe("schema migration: legacy DBs without new columns", () => {
     seed.prepare(
       `INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run("legacyP", process.pid, "/tmp/legacy", null, null, "old", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z");
+    ).run("legacyP", process.pid, "/tmp/legacy", null, null, "old", "2024-01-01T00:00:00Z", new Date().toISOString());
     seed.close();
 
     for (const suffix of ["-wal", "-shm"]) {

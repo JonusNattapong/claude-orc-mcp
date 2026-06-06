@@ -22,6 +22,7 @@ export interface Peer {
   source: string; // "local" or "mcp" (remote federation)
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  has_channel?: boolean; // True if the peer supports real-time push channel notifications
 }
 
 export interface Message {
@@ -46,6 +47,7 @@ export interface RegisterRequest {
   summary: string;
   role?: PeerRole;
   presence?: string;
+  has_channel?: boolean;
 }
 
 export interface RegisterResponse {
@@ -55,6 +57,7 @@ export interface RegisterResponse {
 export interface HeartbeatRequest {
   id: PeerId;
   presence?: string;
+  has_channel?: boolean;
 }
 
 export interface SetSummaryRequest {
@@ -123,6 +126,9 @@ export interface PollMessagesRequest {
   id: PeerId;
   // Optional: only return messages newer than this ISO timestamp.
   since?: string;
+  // If true, return ALL undelivered messages regardless of to_id.
+  // Use this to catch orphaned messages after reconnecting with a new ID.
+  global?: boolean;
 }
 
 export interface PollMessagesResponse {
@@ -135,8 +141,8 @@ export interface MessageHistoryRequest {
   limit?: number;
   // Only return messages newer than this ISO timestamp.
   since?: string;
-  // "inbox" (default, only received), "outbox" (only sent), or "all" (both).
-  direction?: "inbox" | "outbox" | "all";
+  // "inbox" (default, only received), "outbox" (only sent), "all" (both), or "global" (all messages in DB).
+  direction?: "inbox" | "outbox" | "all" | "global";
 }
 
 export interface MessageHistoryResponse {
