@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
 /**
- * claude-peers MCP server
+ * clew-orc MCP server
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to the shared broker daemon for peer discovery and messaging.
  * Declares claude/channel capability to push inbound messages immediately.
  *
  * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
+ *   claude --dangerously-load-development-channels server:clew-orc
  *
  * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ *   { "clew-orc": { "command": "bun", "args": ["./server.ts"] } }
  *
  * New in this fork:
  *   - 2s poll interval (was 1s) to reduce idle CPU while staying responsive
@@ -35,6 +35,10 @@ import type {
   BroadcastResponse,
   Message,
   ThreadResponse,
+  Board,
+  BoardTask,
+  BoardTaskStatus,
+  KanbanResponse,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -125,7 +129,7 @@ async function ensureBroker(): Promise<void> {
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
-  console.error(`[claude-peers] ${msg}`);
+  console.error(`[clew-orc] ${msg}`);
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
@@ -193,15 +197,15 @@ let myRole: PeerRole = "any";
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.2.0" },
+  { name: "clew-orc", version: "0.3.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the clew-orc network. Other Claude Code instances on this machine can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="clew-orc" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
@@ -409,6 +413,124 @@ const TOOLS = [
         },
       },
       required: ["id"],
+    },
+  },
+
+  // --- Identity tools ---
+
+  {
+    name: "set_my_name",
+    description: "Set your own display name visible to other peers. Use this when the user tells you their preferred name.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: { type: "string" as const, description: "Your display name (max 32 chars)" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "set_peer_name",
+    description: "Set a display name for another peer. Useful for a 'boss' to label workers, or to give a friendly name to a peer.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        peer_id: { type: "string" as const, description: "The peer ID to name" },
+        name: { type: "string" as const, description: "Display name (max 32 chars)" },
+      },
+      required: ["peer_id", "name"],
+    },
+  },
+  {
+    name: "get_my_info",
+    description: "Get your own peer info: ID, display name, role, presence, summary, cwd. Useful for knowing who you are in the peer network.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+
+  // --- Board tools ---
+
+  {
+    name: "create_board",
+    description: "Create a shared task board. Boards persist across sessions and are visible to all peers.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: { type: "string" as const, description: "Board name (e.g. 'Sprint 1', 'Bugs')" },
+        description: { type: "string" as const, description: "Optional board description" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "list_boards",
+    description: "List all shared task boards.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "create_board_task",
+    description: "Add a task to a shared board. Tasks persist and are visible to all peers.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        board_id: { type: "number" as const, description: "Board ID to add the task to" },
+        title: { type: "string" as const, description: "Task title" },
+        description: { type: "string" as const, description: "Optional task description" },
+        assigned_to: { type: "string" as const, description: "Optional peer ID to assign this task to" },
+      },
+      required: ["board_id", "title"],
+    },
+  },
+  {
+    name: "update_board_task",
+    description: "Update a task's status, title, description, or assignment.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: { type: "number" as const, description: "Task ID to update" },
+        title: { type: "string" as const, description: "New title" },
+        description: { type: "string" as const, description: "New description" },
+        status: {
+          type: "string" as const,
+          enum: ["todo", "in_progress", "done", "blocked"] as const,
+          description: "New status",
+        },
+        assigned_to: { type: "string" as const, description: "Assign to peer ID, or empty string to unassign" },
+      },
+    },
+  },
+  {
+    name: "list_board_tasks",
+    description: "List tasks on a board, optionally filtered by status or assignee.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        board_id: { type: "number" as const, description: "Board ID" },
+        status: {
+          type: "string" as const,
+          enum: ["todo", "in_progress", "done", "blocked"] as const,
+          description: "Filter by status",
+        },
+        assigned_to: { type: "string" as const, description: "Filter by assigned peer ID" },
+      },
+      required: ["board_id"],
+    },
+  },
+  {
+    name: "board_kanban",
+    description:
+      "View a board as a kanban — all tasks grouped by status (todo/in_progress/done/blocked). Use this to get the full picture of what's happening on a board.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        board_id: { type: "number" as const, description: "Board ID" },
+      },
+      required: ["board_id"],
     },
   },
 ];
@@ -845,6 +967,231 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    // --- Board tool handlers ---
+
+    case "create_board": {
+      const { name, description } = args as { name: string; description?: string };
+      try {
+        const result = await brokerFetch<{ id: number }>("/board/create", { name, description });
+        return {
+          content: [{ type: "text" as const, text: `Board created: "${name}" (ID: ${result.id})` }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "list_boards": {
+      try {
+        const result = await brokerFetch<{ boards: Board[] }>("/board/list");
+        if (result.boards.length === 0) {
+          return { content: [{ type: "text" as const, text: "No boards yet." }] };
+        }
+        const lines = result.boards.map(
+          (b) => `  [${b.id}] ${b.name}${b.description ? ` \u2014 ${b.description}` : ""}  (${b.created_at.slice(0, 10)})`,
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Boards (${result.boards.length}):\n${lines.join("\n")}\n\nUse board_kanban <board_id> to see tasks.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "create_board_task": {
+      const { board_id, title, description, assigned_to } = args as {
+        board_id: number;
+        title: string;
+        description?: string;
+        assigned_to?: string;
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ id: number }>("/board/task/create", {
+          board_id,
+          title,
+          description,
+          assigned_to,
+          created_by: myId,
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: assigned_to
+                ? `Task #${result.id} created on board ${board_id}: "${title}" (assigned to ${assigned_to})`
+                : `Task #${result.id} created on board ${board_id}: "${title}"`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "update_board_task": {
+      const { id, title, description, status, assigned_to } = args as {
+        id: number;
+        title?: string;
+        description?: string;
+        status?: BoardTaskStatus;
+        assigned_to?: string;
+      };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/board/task/update", {
+          id,
+          title,
+          description,
+          status,
+          assigned_to: assigned_to === "" ? null : assigned_to,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed: ${result.error}` }],
+            isError: true,
+          };
+        }
+        const parts: string[] = [`Task #${id} updated`];
+        if (status) parts.push(`status: ${status}`);
+        if (assigned_to !== undefined) parts.push(assigned_to ? `assigned to ${assigned_to}` : "unassigned");
+        return { content: [{ type: "text" as const, text: parts.join(" \u2014 ") }] };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "list_board_tasks": {
+      const { board_id, status, assigned_to } = args as {
+        board_id: number;
+        status?: BoardTaskStatus;
+        assigned_to?: string;
+      };
+      try {
+        const result = await brokerFetch<{ tasks: BoardTask[] }>("/board/task/list", {
+          board_id,
+          status,
+          assigned_to,
+        });
+        if (result.tasks.length === 0) {
+          return { content: [{ type: "text" as const, text: "No tasks found." }] };
+        }
+        const lines = result.tasks.map(
+          (t) =>
+            `  [${t.id}] [${t.status}] ${t.title}${t.assigned_to ? ` (\u2192 ${t.assigned_to})` : ""}${t.description ? `\n       ${t.description}` : ""}`,
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Tasks (${result.tasks.length}):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "board_kanban": {
+      const { board_id } = args as { board_id: number };
+      try {
+        const result = await brokerFetch<KanbanResponse | { error: string }>("/board/task/kanban", { board_id });
+        if ("error" in result) {
+          return {
+            content: [{ type: "text" as const, text: result.error }],
+            isError: true,
+          };
+        }
+        const renderTasks = (tasks: BoardTask[], status: string) => {
+          if (tasks.length === 0) return `  [${status}] \u2014 (empty)`;
+          return tasks
+            .map((t) => `  [${status}] #${t.id} ${t.title}${t.assigned_to ? ` (${t.assigned_to})` : ""}`)
+            .join("\n");
+        };
+        const sections = [
+          `Board: ${result.board.name}`,
+          result.board.description ? `Description: ${result.board.description}` : "",
+          "",
+          renderTasks(result.todo, "todo"),
+          renderTasks(result.in_progress, "in_progress"),
+          renderTasks(result.done, "done"),
+          renderTasks(result.blocked, "blocked"),
+        ];
+        return {
+          content: [{ type: "text" as const, text: sections.filter(Boolean).join("\n") }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "set_my_name": {
+      const { name } = args as { name: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string; name?: string }>("/set-name", { id: myId, name });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Name set to "${result.name}"` }] };
+      } catch (e) { return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true }; }
+    }
+
+    case "set_peer_name": {
+      const { peer_id, name } = args as { peer_id: string; name: string };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string; name?: string }>("/set-name", { id: peer_id, name });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Peer ${peer_id} name set to "${result.name}"` }] };
+      } catch (e) { return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true }; }
+    }
+
+    case "get_my_info": {
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const info = await brokerFetch<Peer & { display_name?: string } | { error: string }>("/peer-info", { id: myId });
+        if ("error" in info) return { content: [{ type: "text" as const, text: info.error }], isError: true };
+        const p = info as Peer & { display_name?: string };
+        const lines = [
+          `ID: ${p.id}`,
+          `Name: ${p.display_name || "(not set)"}`,
+          `Role: ${p.role}`,
+          `Presence: ${p.presence || "-"}`,
+          `Summary: ${p.summary || "-"}`,
+          `CWD: ${p.cwd}`,
+          `PID: ${p.pid}`,
+          `Last seen: ${p.last_seen}`,
+        ];
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (e) { return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true }; }
     }
 
     default:

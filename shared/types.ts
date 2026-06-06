@@ -18,6 +18,8 @@ export interface Peer {
   summary: string;
   role: PeerRole;
   presence: string; // free-form short string ("typing", "idle", "busy", "reviewing", etc.)
+  display_name: string; // friendly name set by user or peer (max 32 chars)
+  source: string; // "local" or "mcp" (remote federation)
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -157,4 +159,81 @@ export interface ThreadResponse {
   replies: Message[];
   // Total messages in the thread (1 + replies.length).
   count: number;
+}
+
+// --- Board types ---
+
+export type BoardTaskStatus = "todo" | "in_progress" | "done" | "blocked";
+
+export const BOARD_TASK_STATUSES: readonly BoardTaskStatus[] = [
+  "todo",
+  "in_progress",
+  "done",
+  "blocked",
+] as const;
+
+export function isBoardTaskStatus(value: unknown): value is BoardTaskStatus {
+  return typeof value === "string" && (BOARD_TASK_STATUSES as readonly string[]).includes(value);
+}
+
+export interface Board {
+  id: number;
+  name: string;
+  description: string;
+  created_at: string;
+}
+
+export interface BoardTask {
+  id: number;
+  board_id: number;
+  title: string;
+  description: string;
+  status: BoardTaskStatus;
+  assigned_to: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateBoardRequest {
+  name: string;
+  description?: string;
+}
+
+export interface CreateBoardResponse {
+  id: number;
+}
+
+export interface ListBoardsResponse {
+  boards: Board[];
+}
+
+export interface CreateBoardTaskRequest {
+  board_id: number;
+  title: string;
+  description?: string;
+  assigned_to?: string;
+  created_by: string;
+}
+
+export interface UpdateBoardTaskRequest {
+  id: number;
+  title?: string;
+  description?: string;
+  status?: BoardTaskStatus;
+  assigned_to?: string | null;
+}
+
+export interface ListBoardTasksRequest {
+  board_id: number;
+  status?: BoardTaskStatus;
+  assigned_to?: string;
+}
+
+export interface KanbanResponse {
+  board: Board;
+  todo: BoardTask[];
+  in_progress: BoardTask[];
+  done: BoardTask[];
+  blocked: BoardTask[];
 }

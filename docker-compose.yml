@@ -1,0 +1,29 @@
+# ──────────────────────────────────────────────
+# clew-orc — Docker Compose
+# ──────────────────────────────────────────────
+# Start:  docker compose up -d
+# Logs:   docker compose logs -f
+# Stop:   docker compose down
+# ──────────────────────────────────────────────
+
+services:
+  broker:
+    build: .
+    container_name: clew-orc-broker
+    ports:
+      - "7899:7899"
+    volumes:
+      - clew-orc-data:/data
+    environment:
+      - CLEW_ORC_PORT=7899
+      - CLEW_ORC_DB=/data/clew-orc.db
+      - CLEW_ORC_TTL_HOURS=24
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7899"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  clew-orc-data:
