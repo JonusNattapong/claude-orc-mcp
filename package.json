@@ -1,14 +1,14 @@
 {
-  "name": "claude-orc",
-  "version": "0.2.0",
-  "description": "Peer discovery, agent roles, broadcast, and messaging for Claude Code instances (Windows/macOS/Linux). Fork of claude-peers-mcp.",
+  "name": "clew-orc",
+  "version": "0.3.0",
+  "description": "Clew-Orc — peer discovery, shared boards, and TUI dashboard for Clew Code instances.",
   "module": "index.ts",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "claude-orc": "./dist/cli.js",
-    "claude-orc-broker": "./dist/broker.js",
-    "claude-orc-server": "./dist/server.js"
+    "clew-orc": "./dist/cli.js",
+    "clew-orc-broker": "./dist/broker.js",
+    "clew-orc-server": "./dist/server.js"
   },
   "files": [
     "dist",
@@ -21,28 +21,32 @@
     "broker": "bun broker.ts",
     "server": "bun server.ts",
     "cli": "bun cli.ts",
+    "dashboard": "bun dashboard.tsx",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "build": "bun build broker.ts --target=bun --outdir dist && bun build server.ts --target=node --outdir dist --external @modelcontextprotocol/sdk && bun build cli.ts --target=bun --outdir dist",
     "prepublishOnly": "bun run typecheck && bun run test && bun run build"
   },
   "keywords": [
-    "claude",
-    "claude-code",
+    "clew",
+    "clew-code",
     "mcp",
     "mcp-server",
     "agent",
     "multi-agent",
     "peer-discovery",
-    "broadcast"
+    "board"
   ],
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/react": "^19.2.17"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "ink": "^7.0.5",
+    "react": "^19.2.7"
   }
 }
