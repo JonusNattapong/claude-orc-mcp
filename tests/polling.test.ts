@@ -274,6 +274,7 @@ describe("server.ts static guarantees", () => {
       "set_role",
       "set_presence",
       "message_history",
+      "get_thread",
       "check_messages",
     ]) {
       expect(src).toContain(`name: "${name}"`);

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * claude-peers broker daemon
+ * clew-orc broker daemon
  *
  * A singleton HTTP server on localhost:7899 backed by SQLite.
  * Tracks all registered Claude Code peers and routes messages between them.
@@ -8,12 +8,13 @@
  * Auto-launched by the MCP server if not already running.
  * Run directly: bun broker.ts
  *
- * Backward compatible with original claude-peers. New in this fork:
+ * Backward compatible with original clew-orc. New in this fork:
  *   - agent roles (boss/worker/reviewer/any)
  *   - /broadcast endpoint to message every peer at once
  *   - /messages/history endpoint to query past messages
  *   - /set-presence + presence column for "typing" / activity status
  *   - message TTL (configurable, default 24h)
+ *   - /messages/thread endpoint and reply_to column for threaded conversations
  *   - cross-platform process liveness check (works on Windows + Unix)
  */
 
@@ -34,17 +35,45 @@ import type {
   PollMessagesResponse,
   MessageHistoryRequest,
   MessageHistoryResponse,
+  ThreadRequest,
+  ThreadResponse,
   Peer,
   PeerRole,
   Message,
+  Board,
+  BoardTask,
+  BoardTaskStatus,
+  CreateBoardRequest,
+  CreateBoardResponse,
+  ListBoardsResponse,
+  CreateBoardTaskRequest,
+  UpdateBoardTaskRequest,
+  ListBoardTasksRequest,
+  KanbanResponse,
 } from "./shared/types.ts";
-import { isPeerRole } from "./shared/types.ts";
+import { isPeerRole, isBoardTaskStatus } from "./shared/types.ts";
 import { isProcessAlive } from "./shared/platform.ts";
 
-const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
-// Default message TTL: 24 hours. Set to 0 to disable expiry.
-const MESSAGE_TTL_HOURS = Math.max(0, parseFloat(process.env.CLAUDE_PEERS_MESSAGE_TTL_HOURS ?? "24"));
+const PORT = parseInt(process.env.CLEW_ORC_PORT ?? process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const HOST = process.env.CLEW_ORC_HOST ?? "0.0.0.0";
+const AUTH_TOKEN = process.env.CLEW_ORC_TOKEN ?? "";
+
+// TLS config (provide cert/key paths for HTTPS)
+const TLS_CERT = process.env.CLEW_ORC_TLS_CERT ?? "";
+const TLS_KEY = process.env.CLEW_ORC_TLS_KEY ?? "";
+const TLS_PASS = process.env.CLEW_ORC_TLS_PASS ?? "";
+const USE_TLS = !!(TLS_CERT && TLS_KEY);
+
+function getDefaultDbPath(): string {
+  const fromEnv = process.env.CLEW_ORC_DB ?? process.env.CLAUDE_PEERS_DB;
+  if (fromEnv) return fromEnv;
+  const home = process.env.HOME ?? process.env.USERPROFILE;
+  if (!home) return ".clew-orc.db";
+  const sep = process.platform === "win32" ? "\\" : "/";
+  return `${home}${sep}.clew-orc.db`;
+}
+const DB_PATH = getDefaultDbPath();
+const MESSAGE_TTL_HOURS = Math.max(0, parseFloat(process.env.CLEW_ORC_TTL_HOURS ?? process.env.CLAUDE_PEERS_MESSAGE_TTL_HOURS ?? "24"));
 // Cleanup interval: every 5 minutes.
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -83,6 +112,12 @@ db.run(`
   if (!cols.has("presence")) {
     db.run("ALTER TABLE peers ADD COLUMN presence TEXT NOT NULL DEFAULT ''");
   }
+  if (!cols.has("display_name")) {
+    db.run("ALTER TABLE peers ADD COLUMN display_name TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.has("source")) {
+    db.run("ALTER TABLE peers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+  }
 }
 
 db.run(`
@@ -110,11 +145,47 @@ db.run(`
   if (!msgCols.has("expires_at")) {
     db.run("ALTER TABLE messages ADD COLUMN expires_at TEXT");
   }
+  if (!msgCols.has("reply_to")) {
+    // reply_to points at messages.id of the parent message in a thread.
+    // NULL means "this is a root message (not a reply)".
+    db.run("ALTER TABLE messages ADD COLUMN reply_to INTEGER");
+  }
 }
 
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_to_undelivered ON messages(to_id, delivered, sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id, sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL");
+db.run("CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to) WHERE reply_to IS NOT NULL");
+
+// --- Board tables ---
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS boards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS board_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'todo',
+    assigned_to TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (board_id) REFERENCES boards(id)
+  )
+`);
+
+db.run("CREATE INDEX IF NOT EXISTS idx_board_tasks_board ON board_tasks(board_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status)");
+db.run("CREATE INDEX IF NOT EXISTS idx_board_tasks_assigned ON board_tasks(assigned_to)");
 
 // --- Periodic cleanup ---
 
@@ -167,6 +238,10 @@ const updatePresence = db.prepare(`
   UPDATE peers SET presence = ? WHERE id = ?
 `);
 
+const updateName = db.prepare(`
+  UPDATE peers SET display_name = ? WHERE id = ?
+`);
+
 const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
 `);
@@ -192,8 +267,8 @@ const selectPeersByRole = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, expires_at)
-  VALUES (?, ?, ?, ?, 0, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, expires_at, reply_to)
+  VALUES (?, ?, ?, ?, 0, ?, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -231,6 +306,42 @@ const selectHistoryAll = db.prepare(`
   ORDER BY sent_at DESC, id DESC
   LIMIT ?
 `);
+
+// Walks the reply_to chain from `id` up to the root, then collects every
+// message in the thread in chronological order. Recursive CTE finds both
+// the root and all descendants in a single query.
+//
+// `up` walks from the given message to its ancestors via reply_to.
+// `root` picks the first ancestor whose reply_to is NULL (the thread root).
+// `down` walks from the root to all descendants via the reverse of reply_to.
+const selectThread = db.query<
+  Message,
+  [number]
+>(`
+  WITH RECURSIVE
+  up(id, reply_to) AS (
+    SELECT id, reply_to FROM messages WHERE id = ?
+    UNION ALL
+    SELECT m.id, m.reply_to FROM messages m
+    JOIN up u ON m.id = u.reply_to
+  ),
+  root(id) AS (
+    SELECT id FROM up WHERE reply_to IS NULL
+  ),
+  down(id) AS (
+    SELECT id FROM root
+    UNION ALL
+    SELECT m.id FROM messages m
+    JOIN down d ON m.reply_to = d.id
+  )
+  SELECT m.* FROM messages m
+  WHERE m.id IN (SELECT id FROM down)
+  ORDER BY m.sent_at ASC, m.id ASC
+`);
+
+const messageExists = db.query<{ id: number }, [number]>(
+  `SELECT id FROM messages WHERE id = ?`
+);
 
 // --- Generate peer ID ---
 
@@ -277,6 +388,8 @@ function rowToPeer(row: Record<string, unknown>): Peer {
     summary: String(row.summary ?? ""),
     role: coerceRole(row.role),
     presence: String(row.presence ?? ""),
+    display_name: String(row.display_name ?? ""),
+    source: String(row.source ?? "local"),
     registered_at: String(row.registered_at),
     last_seen: String(row.last_seen),
   };
@@ -347,6 +460,22 @@ function handleSetPresence(body: SetPresenceRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+function handleSetName(body: { id: string; name: string }): { ok: boolean; error?: string } {
+  const target = selectPeerById.get(body.id) as { id: string } | null;
+  if (!target) {
+    return { ok: false, error: `Peer ${body.id} not found` };
+  }
+  const name = body.name.replace(/[\x00-\x1f]/g, "").slice(0, 32);
+  updateName.run(name, body.id);
+  return { ok: true, name };
+}
+
+function handlePeerInfo(body: { id: string }): Peer | { error: string } {
+  const peer = selectPeerById.get(body.id) as Peer | null;
+  if (!peer) return { error: `Peer ${body.id} not found` };
+  return peer;
+}
+
 function handleListPeers(body: ListPeersRequest): Peer[] {
   let rows: Record<string, unknown>[];
 
@@ -407,14 +536,29 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
+  // Validate reply_to if provided. The parent message must exist; we
+  // intentionally do NOT require it to involve the same peers, so any
+  // peer can reply to any message they have access to.
+  let replyTo: number | null = null;
+  if (body.reply_to != null) {
+    if (typeof body.reply_to !== "number" || !Number.isFinite(body.reply_to) || !Number.isInteger(body.reply_to) || body.reply_to <= 0) {
+      return { ok: false, error: `reply_to must be a positive integer` };
+    }
+    const parent = messageExists.get(body.reply_to);
+    if (!parent) {
+      return { ok: false, error: `reply_to message ${body.reply_to} not found` };
+    }
+    replyTo = body.reply_to;
+  }
+
   const expiresAt = computeExpiry(body.ttl_seconds);
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), expiresAt);
+  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), expiresAt, replyTo);
   return { ok: true };
 }
 
 function handleBroadcast(body: BroadcastRequest): BroadcastResponse {
   // Allow "cli" as a special sender for the bundled CLI (matches /send-message).
-  if (body.from_id !== "cli") {
+  if (body.from_id !== "cli" && body.from_id !== "dashboard") {
     const sender = selectPeerById.get(body.from_id) as { id: string } | null;
     if (!sender) {
       return {
@@ -443,6 +587,29 @@ function handleBroadcast(body: BroadcastRequest): BroadcastResponse {
     roles = validated;
   }
 
+  // Validate reply_to if provided (same rules as send-message).
+  let replyTo: number | null = null;
+  if (body.reply_to != null) {
+    if (typeof body.reply_to !== "number" || !Number.isFinite(body.reply_to) || !Number.isInteger(body.reply_to) || body.reply_to <= 0) {
+      return {
+        ok: false,
+        count: 0,
+        delivered_to: [],
+        error: `reply_to must be a positive integer`,
+      };
+    }
+    const parent = messageExists.get(body.reply_to);
+    if (!parent) {
+      return {
+        ok: false,
+        count: 0,
+        delivered_to: [],
+        error: `reply_to message ${body.reply_to} not found`,
+      };
+    }
+    replyTo = body.reply_to;
+  }
+
   const includeSet = body.include_ids && body.include_ids.length > 0
     ? new Set(body.include_ids)
     : null;
@@ -460,7 +627,7 @@ function handleBroadcast(body: BroadcastRequest): BroadcastResponse {
   const expiresAt = computeExpiry(body.ttl_seconds);
   const delivered: string[] = [];
   for (const target of candidates) {
-    insertMessage.run(body.from_id, target.id, body.text, sentAt, expiresAt);
+    insertMessage.run(body.from_id, target.id, body.text, sentAt, expiresAt, replyTo);
     delivered.push(target.id);
   }
 
@@ -515,18 +682,168 @@ function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryRespon
   return { messages: rows, count: rows.length };
 }
 
+function handleThread(body: ThreadRequest): ThreadResponse | { error: string } {
+  if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+    return { error: "id must be a positive integer" };
+  }
+  // Cheap existence check up front so we can return a clean 404 for
+  // unknown ids instead of an empty thread.
+  const exists = messageExists.get(body.id);
+  if (!exists) {
+    return { error: `message ${body.id} not found` };
+  }
+  const rows = selectThread.all(body.id) as Message[];
+  if (rows.length === 0) {
+    // Defensive: should not happen because we just confirmed existence.
+    return { error: `message ${body.id} not found` };
+  }
+  // The root is the row whose reply_to is null. Prefer the one matching the
+  // requested id (in case the request asked for the root directly); otherwise
+  // the earliest reply_to === null row in the chain.
+  const root: Message =
+    rows.find((m) => m.reply_to == null && m.id === body.id) ??
+    rows.find((m) => m.reply_to == null) ??
+    rows[0]!;
+  const replies = rows.filter((m) => m.id !== root.id);
+  return { root, replies, count: rows.length };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Remote MCP federation ---
+
+function handleRemoteSync(body: { token: string; peers: Peer[] }): { ok: boolean; count: number } | { error: string } {
+  if (AUTH_TOKEN && body.token !== AUTH_TOKEN) {
+    return { error: "Invalid token" };
+  }
+  // Remove old MCP peers
+  db.run("DELETE FROM peers WHERE source = 'mcp'");
+  // Insert remote peers as source='mcp'
+  const now = new Date().toISOString();
+  let count = 0;
+  for (const p of body.peers) {
+    try {
+      db.run(
+        "INSERT OR REPLACE INTO peers (id, pid, cwd, git_root, tty, summary, role, presence, display_name, source, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'mcp', ?, ?)",
+        [p.id, p.pid, p.cwd, p.git_root, p.tty || "", p.summary || "", p.role || "any", p.presence || "", p.display_name || "", now, now],
+      );
+      count++;
+    } catch { /* skip duplicates */ }
+  }
+  return { ok: true, count };
+}
+
+function handleGetRemoteInfo(): { host: string; port: number; peer_count: number } {
+  return {
+    host: HOST,
+    port: PORT,
+    peer_count: (selectAllPeers.all() as Peer[]).length,
+  };
+}
+
+// --- Board handlers ---
+
+function handleCreateBoard(body: CreateBoardRequest): CreateBoardResponse {
+  const now = new Date().toISOString();
+  const result = db.run("INSERT INTO boards (name, description, created_at) VALUES (?, ?, ?)", [
+    body.name,
+    body.description ?? "",
+    now,
+  ]);
+  return { id: Number(result.lastInsertRowid) };
+}
+
+function handleListBoards(): ListBoardsResponse {
+  const rows = db.query("SELECT * FROM boards ORDER BY created_at DESC").all() as Board[];
+  return { boards: rows };
+}
+
+function handleCreateBoardTask(body: CreateBoardTaskRequest): { id: number } {
+  const now = new Date().toISOString();
+  const status: BoardTaskStatus = "todo";
+  const result = db.run(
+    "INSERT INTO board_tasks (board_id, title, description, status, assigned_to, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [body.board_id, body.title, body.description ?? "", status, body.assigned_to ?? null, body.created_by, now, now],
+  );
+  return { id: Number(result.lastInsertRowid) };
+}
+
+function handleUpdateBoardTask(body: UpdateBoardTaskRequest): { ok: boolean; error?: string } {
+  const existing = db.query("SELECT * FROM board_tasks WHERE id = ?").get(body.id) as BoardTask | null;
+  if (!existing) {
+    return { ok: false, error: `Task ${body.id} not found` };
+  }
+
+  if (body.status !== undefined && !isBoardTaskStatus(body.status)) {
+    return { ok: false, error: `Invalid status: ${body.status}` };
+  }
+
+  const now = new Date().toISOString();
+  const updates: string[] = ["updated_at = ?"];
+  const params: unknown[] = [now];
+
+  if (body.title !== undefined) { updates.push("title = ?"); params.push(body.title); }
+  if (body.description !== undefined) { updates.push("description = ?"); params.push(body.description); }
+  if (body.status !== undefined) { updates.push("status = ?"); params.push(body.status); }
+  if (body.assigned_to !== undefined) { updates.push("assigned_to = ?"); params.push(body.assigned_to); }
+
+  params.push(body.id);
+  db.run(`UPDATE board_tasks SET ${updates.join(", ")} WHERE id = ?`, params);
+  return { ok: true };
+}
+
+function handleListBoardTasks(body: ListBoardTasksRequest): { tasks: BoardTask[] } {
+  let sql = "SELECT * FROM board_tasks WHERE board_id = ?";
+  const params: unknown[] = [body.board_id];
+
+  if (body.status) { sql += " AND status = ?"; params.push(body.status); }
+  if (body.assigned_to) { sql += " AND assigned_to = ?"; params.push(body.assigned_to); }
+
+  sql += " ORDER BY created_at DESC";
+  const tasks = db.query(sql).all(...params) as BoardTask[];
+  return { tasks };
+}
+
+function handleKanban(body: { board_id: number }): KanbanResponse | { error: string } {
+  const board = db.query("SELECT * FROM boards WHERE id = ?").get(body.board_id) as Board | null;
+  if (!board) return { error: `Board ${body.board_id} not found` };
+
+  const tasks = db.query("SELECT * FROM board_tasks WHERE board_id = ? ORDER BY created_at ASC").all(body.board_id) as BoardTask[];
+
+  const categorize = (status: BoardTaskStatus) => tasks.filter(t => t.status === status);
+
+  return {
+    board,
+    todo: categorize("todo"),
+    in_progress: categorize("in_progress"),
+    done: categorize("done"),
+    blocked: categorize("blocked"),
+  };
+}
+
 // --- HTTP Server ---
+
+function validateAuth(req: Request): Response | null {
+  if (!AUTH_TOKEN) return null;
+  const auth = req.headers.get("authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth.startsWith("X-Token ") ? auth.slice(8) : "";
+  if (token !== AUTH_TOKEN) return Response.json({ error: "Unauthorized" }, { status: 401 });
+  return null;
+}
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
+  hostname: HOST,
+  tls: USE_TLS ? { certFile: TLS_CERT, keyFile: TLS_KEY, passphrase: TLS_PASS || undefined } : undefined,
   async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
+    const path = new URL(req.url).pathname;
+    // Auth check (skip /health and /remote/info for discovery)
+    if (path !== "/health" && path !== "/remote/info") {
+      const authErr = validateAuth(req);
+      if (authErr) return authErr;
+    }
 
     if (req.method !== "POST") {
       if (path === "/health") {
@@ -534,9 +851,11 @@ Bun.serve({
           status: "ok",
           peers: (selectAllPeers.all() as Peer[]).length,
           message_ttl_hours: MESSAGE_TTL_HOURS,
+          host: HOST,
+          tls: USE_TLS,
         });
       }
-      return new Response("claude-peers broker", { status: 200 });
+      return new Response("clew-orc broker", { status: 200 });
     }
 
     try {
@@ -555,6 +874,10 @@ Bun.serve({
           return Response.json(handleSetRole(body as SetRoleRequest));
         case "/set-presence":
           return Response.json(handleSetPresence(body as SetPresenceRequest));
+        case "/set-name":
+          return Response.json(handleSetName(body as { id: string; name: string }));
+        case "/peer-info":
+          return Response.json(handlePeerInfo(body as { id: string }));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/list-peers-by-role":
@@ -567,9 +890,32 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/messages/history":
           return Response.json(handleMessageHistory(body as MessageHistoryRequest));
+        case "/messages/thread":
+          return Response.json(handleThread(body as ThreadRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
+
+        // --- Board endpoints ---
+        case "/board/create":
+          return Response.json(handleCreateBoard(body as CreateBoardRequest));
+        case "/board/list":
+          return Response.json(handleListBoards());
+        case "/board/task/create":
+          return Response.json(handleCreateBoardTask(body as CreateBoardTaskRequest));
+        case "/board/task/update":
+          return Response.json(handleUpdateBoardTask(body as UpdateBoardTaskRequest));
+        case "/board/task/list":
+          return Response.json(handleListBoardTasks(body as ListBoardTasksRequest));
+        case "/board/task/kanban":
+          return Response.json(handleKanban(body as { board_id: number }));
+
+        // --- Remote MCP federation ---
+        case "/remote/sync":
+          return Response.json(handleRemoteSync(body as { token: string; peers: Peer[] }));
+        case "/remote/info":
+          return Response.json(handleGetRemoteInfo());
+
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }
@@ -581,5 +927,5 @@ Bun.serve({
 });
 
 console.error(
-  `[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH}, ttl_hours: ${MESSAGE_TTL_HOURS})`
+  `[clew-orc broker] listening on ${HOST}:${PORT}${USE_TLS ? " (TLS)" : ""} (db: ${DB_PATH}, ttl_hours: ${MESSAGE_TTL_HOURS})${AUTH_TOKEN ? " [auth enabled]" : ""}`
 );
